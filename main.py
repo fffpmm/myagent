@@ -32,8 +32,6 @@ def run_bash(command:str):
         return out[:50000] if out else "没有out"
     except subprocess.TimeoutError:
         return "error:超时120"
-    except (FileExistsError, OSError) as e:
-        return f"error:{e}"
 
 def safe_path(p:str)->str:
     path = (WORKDIR/p).resolve()
@@ -49,7 +47,7 @@ def run_read(path:str,limit:int|None=None):
             lines = lines[:limit] + [f"还有{len(lines)-limit}行未显示"]
         return "\n".join(lines)
     except Exception as e:
-        return f"error:读取文件错误"
+        return f"error:读取文件错误{e}"
 
 def run_write(path:str, content:str):
     try:
@@ -192,6 +190,29 @@ TOOL_HANDERS = {
     "glob":run_glob
 }
 
+#=========钩子函数==================
+HOOKS={
+    "BEFORE_AGENT":[],
+    "BEFORE_TOOL":[],
+    "AFTER_TOOL":[],
+    "AFTER_AGENT":[]
+}
+
+def register_hook(event:str,callback):
+    HOOKS[event].append(callback)
+
+
+def trigger_hook(event:str,*args):
+    for callback in HOOKS(event):
+        result=callback(*args)
+        if result:
+            return result
+    return None
+
+
+
+
+
 #========防止模型越级操作===========
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
 
@@ -204,11 +225,11 @@ def check_deny_list(command:str):
 
 # gata2: 规则匹配 
 PERMISSION_ROLES=[{    
-    "tools":["run_write","run_edit"],
+    "tools":["write","edit"],
     "check":lambda args: not (WORKDIR/args.get("path","")).resolve().is_relative_to(WORKDIR),
     "messages":"跳出工作目录的写入或编辑操作"
 },{
-    "tools":["run_bash"],
+    "tools":["bash"],
     "check":lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
     "messages":"危险的bash命令"
 }]
@@ -226,16 +247,16 @@ def ask_user(tool_name: str, args: dict, reason: str) -> str:
     return "allow" if choice in ("y", "yes") else "deny"
 
 
-# 三个gata合三为一
-def check_permission(block:str)->bool:
-    if block.name =="bash":
+# 三个gata合三为一   
+def check_permission(block) -> bool:
+    if block.name == "bash":
         args = json.loads(block.arguments)
         result=check_deny_list(args.get("command",""))
         if result:
             return False
     reason=check_rules(block.name,json.loads(block.arguments))
     if reason:
-        decision = ask_user(block.name, block.input, reason)
+        decision = ask_user(block.name, block.arguments, reason)
         if decision == "deny":
             return False
     return True
@@ -263,31 +284,23 @@ def agent_loop(messages:list):
                  "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                 for tc in assistant_msg.tool_calls]
         messages.append(msg)
+        
         if response.choices[0].finish_reason != "tool_calls":
             return
-        
-
-        """for tc in response.choices[0].message.tool_calls:  只有一个工具的用法
-            args = json.loads(tc.function.arguments)
-            output = run_bash(args["command"])
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": output}) """ 
-
-
+            
 
         result =[]
         for tc in response.choices[0].message.tool_calls: #这里之所以要用for循环是因为可能会有多个工具调用
-            #1.先进行权限判断check_permission
-            if not check_permission(tc.function.name):  # 传函数名(字符串)，不是function对象
+            #==1.先进行权限判断check_permission==
+            if not check_permission(tc.function):  # 传函数名(字符串)，不是function对象
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": "拒绝访问"})
                 continue
-                
-
             
-            #2.进行工具调用handler
+            #==2.进行工具调用handler==
             handler = TOOL_HANDERS.get(tc.function.name)
             args = json.loads(tc.function.arguments)#这么写是因为ai返回的response的json字符串必须先转化成python字典才能解包或者用[]
             if handler:
-                output = handler(**args) if isinstance(args, dict) else handler(args)
+                output = handler(**args) if isinstance(args, dict) else handler(args)#单工具的调用output = run_bash(args["command"])
             else:
                 output = f"error: unknown tool {tc.function.name}"
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})   
