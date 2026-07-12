@@ -288,12 +288,12 @@ def permission_check_hook(block):
             ask_result = ask_user()
             if ask_result=="deny":
                 return "请求被用户拒绝"
-        return None
+    return None
 
 # 日志钩子函数 记录每一个工具的调用信息
 def log_hook(block):
     args=json.loads(block.function.arguments)
-    args_preview =str(args.values()[:2])[:50]
+    args_preview =str(list(args.values())[:2])[:50]
     print(f"[HOOK] {block.function.name} {args_preview}")
     return None
 
@@ -314,7 +314,7 @@ def context_inject_hook(query:str):
 # 看钩子函数数量的钩子函数
 def summary_hook(messages:list):
     tool_count = sum(1 for m in messages if m.get("role","") =="tool")
-    return True
+    return None
 
 register_hook("BEFORE_AGENT",context_inject_hook)
 register_hook("BEFORE_TOOL",permission_check_hook)
