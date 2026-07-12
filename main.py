@@ -292,8 +292,9 @@ def permission_check_hook(block):
 
 # 日志钩子函数 记录每一个工具的调用信息
 def log_hook(block):
-    args_preview =str(block.function.arguments.values()[:2])[:50]
-    print(f"[HOOK] {block.funtion.name} {args_preview}")
+    args=json.loads(block.function.arguments)
+    args_preview =str(args.values()[:2])[:50]
+    print(f"[HOOK] {block.function.name} {args_preview}")
     return None
 
 #最大输出警告钩子函数
@@ -353,7 +354,7 @@ def agent_loop(messages:list):
         for tc in response.choices[0].message.tool_calls:
             if not tc:
                 continue
-            arg_special=response.choices[0].message.tool_calls[0]
+            arg_special=tc
             # ==钩子函数== 虽然接受钩子函数的返回值并写入tool里面但是这些钩子函数都没有返回值
             blocked=trigger_hook("BEFORE_TOOL", arg_special)
             if blocked:
@@ -364,7 +365,7 @@ def agent_loop(messages:list):
         
             #==进行工具调用handler==  调用工具就是把模型想要工具参数放进函数里，里面都是自动化开始处理
             handler = TOOL_HANDERS.get(tc.function.name)
-            arg_special=response.choices[0].message.tool_calls[0]
+            arg_special=tc
             args = json.loads(tc.function.arguments)  #这么写是因为ai返回的response的json字符串必须先转化成python字典才能解包或者用[]
             if handler:  # handler的参数可以由args随意提供因为我们使用的参数都是大模型提供，我只需要解包
                 output = handler(**args) if isinstance(args, dict) else handler(args)#单工具的调用output = run_bash(args["command"])
