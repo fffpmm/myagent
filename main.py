@@ -190,30 +190,12 @@ TOOL_HANDERS = {
     "glob":run_glob
 }
 
-#=========钩子函数==================
-HOOKS={
-    "BEFORE_AGENT":[],
-    "BEFORE_TOOL":[],
-    "AFTER_TOOL":[],
-    "AFTER_AGENT":[]
-}
-
-def register_hook(event:str,callback):
-    HOOKS[event].append(callback)
-
-
-def trigger_hook(event:str,*args):
-    for callback in HOOKS(event):
-        result=callback(*args)
-        if result:
-            return result
-    return None
 
 
 
 
 
-#========防止模型越级操作===========
+#========防止模型越级操作=================================================================================================
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
 
 # gata1：否定命名列表
@@ -235,6 +217,7 @@ PERMISSION_ROLES=[{
 }]
 #两个lambda函数都是返回一个布尔值
 
+#它是拿ai返回的消息结果进行匹配
 def check_rules(tool_name:str,args:dict):
     for role in PERMISSION_ROLES:
         if tool_name in role["tools"] and role["check"](args):
@@ -242,12 +225,13 @@ def check_rules(tool_name:str,args:dict):
     return None
 
 # gata3: 用户权限控制
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
+def ask_user() -> str:
     choice = input("   Allow? [y/N] ").strip().lower()
     return "allow" if choice in ("y", "yes") else "deny"
 
 
-# 三个gata合三为一   
+# 三个gata合三为一    这个如同gata2一样，根据模型的结果放进这个函数进行一系列比对拿答案的
+"""
 def check_permission(block) -> bool:
     if block.name == "bash":
         args = json.loads(block.arguments)
@@ -256,17 +240,92 @@ def check_permission(block) -> bool:
             return False
     reason=check_rules(block.name,json.loads(block.arguments))
     if reason:
-        decision = ask_user(block.name, block.arguments, reason)
+        decision = ask_user()
         if decision == "deny":
             return False
     return True
+"""
+
+#========钩子函数=========================================================================================================
+DESTRUCTIVE=["rm ", "> /etc/", "chmod 777"]
 
 
 
+HOOKS={
+    "BEFORE_AGENT":[],
+    "BEFORE_TOOL":[],
+    "AFTER_TOOL":[],
+    "AFTER_AGENT":[]
+}
 
-#========防止模型越级操作===========
+def register_hook(event:str,callback):
+    HOOKS[event].append(callback)
+
+
+def trigger_hook(event:str,*args):
+    for callback in HOOKS[event]:
+        result=callback(*args)
+        if result:
+            return result
+    return None
+
+# 防越级操作钩子函数（三合一)  替代升级了上面的三合一的越级操作但功能一致 只是要将其注册为了钩子函数
+def permission_check_hook(block):
+    if block.function.name == "bash":
+        args = json.loads(block.function.arguments)
+        for pattern in DENY_LIST:
+            if pattern in args.get("command", ""):
+                return "Permission denied by deny list"
+        for kw in DESTRUCTIVE:
+            if kw in args.get("command", ""):
+                choice = input("   Allow? [y/N] ").strip().lower()
+                if choice not in ("y", "yes"):
+                    return "Permission denied by user"
+    if block.function.name in ("write","edit"):
+        args = json.loads(block.function.arguments)
+        path = args.get("path","")
+        if not (WORKDIR/path).resolve().is_relative_to(WORKDIR):
+            ask_result = ask_user()
+            if ask_result=="deny":
+                return "请求被用户拒绝"
+        return None
+
+# 日志钩子函数 记录每一个工具的调用信息
+def log_hook(block):
+    args_preview =str(block.function.arguments.values()[:2])[:50]
+    print(f"[HOOK] {block.funtion.name} {args_preview}")
+    return None
+
+#最大输出警告钩子函数
+def large_output_hook(block,output):
+    if len(str(output)) > 10000:
+        print(f"[HOOK]:输出过长，请查看日志")
+    return None
+
+
+
+# 看上下文工作地址的工具函数
+def context_inject_hook(query:str):
+    print(f"[HOOK] 检查工作地址{WORKDIR}")
+    return None
+
+
+# 看钩子函数数量的钩子函数
+def summary_hook(messages:list):
+    tool_count = sum(1 for m in messages if m.get("role","") =="tool")
+    return True
+
+register_hook("BEFORE_AGENT",context_inject_hook)
+register_hook("BEFORE_TOOL",permission_check_hook)
+register_hook("BEFORE_TOOL",log_hook)
+register_hook("AFTER_TOOL",large_output_hook)
+register_hook("AFTER_AGENT",summary_hook)
+
+#=========agent循环========================================================================================================  =================   
+
+
 def agent_loop(messages:list):
-    while True:
+    while True: 
         response = client.chat.completions.create(
         model="deepseek-v4-pro",
         messages=messages,
@@ -276,8 +335,8 @@ def agent_loop(messages:list):
     
         # messages.append({"role":"assistant","content":response.choices[0].message.content}) 不能这样是因为openai和Claude的contennt不一样openai的message里有content和tools_calls两者是分开的而claude的content直接两者都是一个列表的
         assistant_msg = response.choices[0].message
-
         msg = {"role": "assistant", "content": assistant_msg.content}
+        # 这里就是添加content和tool_calls 判断有的话就添加
         if assistant_msg.tool_calls:
             msg["tool_calls"] = [
                 {"id": tc.id, "type": "function",
@@ -285,24 +344,33 @@ def agent_loop(messages:list):
                 for tc in assistant_msg.tool_calls]
         messages.append(msg)
         
+
         if response.choices[0].finish_reason != "tool_calls":
+            trigger_hook("AFTER_AGENT", messages)
             return
             
-
-        result =[]
-        for tc in response.choices[0].message.tool_calls: #这里之所以要用for循环是因为可能会有多个工具调用
-            #==1.先进行权限判断check_permission==
-            if not check_permission(tc.function):  # 传函数名(字符串)，不是function对象
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": "拒绝访问"})
+        # arg_special是钩子函数的block args是工具函数的block参数
+        for tc in response.choices[0].message.tool_calls:
+            if not tc:
                 continue
-            
-            #==2.进行工具调用handler==
+            arg_special=response.choices[0].message.tool_calls[0]
+            # ==钩子函数== 虽然接受钩子函数的返回值并写入tool里面但是这些钩子函数都没有返回值
+            blocked=trigger_hook("BEFORE_TOOL", arg_special)
+            if blocked:
+                messages.append({"role":"tool","content":blocked})
+                continue
+        
+    
+        
+            #==进行工具调用handler==  调用工具就是把模型想要工具参数放进函数里，里面都是自动化开始处理
             handler = TOOL_HANDERS.get(tc.function.name)
-            args = json.loads(tc.function.arguments)#这么写是因为ai返回的response的json字符串必须先转化成python字典才能解包或者用[]
-            if handler:
+            arg_special=response.choices[0].message.tool_calls[0]
+            args = json.loads(tc.function.arguments)  #这么写是因为ai返回的response的json字符串必须先转化成python字典才能解包或者用[]
+            if handler:  # handler的参数可以由args随意提供因为我们使用的参数都是大模型提供，我只需要解包
                 output = handler(**args) if isinstance(args, dict) else handler(args)#单工具的调用output = run_bash(args["command"])
             else:
                 output = f"error: unknown tool {tc.function.name}"
+            trigger_hook("AFTER_TOOL", arg_special, output)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})   
 
         
@@ -324,6 +392,9 @@ if __name__ == "__main__":
                 break
             history.append({"role":"user","content":query})
 
+
+            trigger_hook("BEFORE_AGENT", query)
             agent_loop(history)
+
             print(history)
             
