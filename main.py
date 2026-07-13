@@ -16,6 +16,14 @@ CURRENT_TODOS:list[dict]=[]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
+SUB_SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Complete the task you were given, then return a concise summary. "
+    "Do not delegate further."
+)
+
+
+
 
 client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com")
@@ -86,7 +94,7 @@ def run_glob(patten:str):
 
 
 
-#========模型调用工具函数（提醒模型类不进行外部操作）======================================================================
+#========模型调用工具函数（该工具不进行外部操作只做提醒和打印在终端）======================================================================
 
 # 对todos的消息类型进行检测 只要列表里是字典的   todos这个参数也是像其他工具函数一样的由大模型定义给它
 def _normalize_todos(todos):
@@ -130,10 +138,171 @@ def run_todo_write(todos:list):
     return f"更新了{len(CURRENT_TODOS)}个任务"
         
 
+# =========子agent=====================================================================================================
+
+# 子agent工具调用
+SUB_TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "运行一个命令去工作",
+            "parameters": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "设置一个命令"
+                    }
+                }
+            }
+        }
+    },{
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "读取一个文件的内容",
+            "parameters": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径"
+                    },
+                    "limit":{
+                        "type":"integer",
+                        "description":"限制读取的行数"
+                    }
+                }
+            }
+        }
+    },{
 
 
+        "type": "function",
+        "function": {
+            "name": "write",
+            "description": "写入一个文件的内容",
+            "parameters": {
+                "type": "object",
+                "required": ["path","content"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径"
+                    },
+                    "content":{
+                        "type":"string",
+                        "description":"写入的内容"
+                    }
+                }
+            }
+        }
+    },{
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "description": "编辑一个文件",
+            "parameters": {
+                "type": "object",
+                "required": ["path","old_content","new_content"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径"
+                    },
+                    "old_content":{
+                        "type":"string",
+                        "description": "要被替换的内容"
+                    },
+                    "new_content":{
+                        "type":"string",
+                        "description": "新的内容"
+                    }
+                }
+            }
+        }
+    },{
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "检索文件",
+            "parameters": {
+                "type": "object",
+                "required": ["patten"],
+                "properties": {
+                    "patten": {
+                        "type": "string",
+                        "description": "检索的通配符"
+                    }
+                }
+            }
+        }
+    },
+    ]
 
 
+SUB_TOOL_HANDERS = {
+    "bash": run_bash,
+    "read":run_read,
+    "write":run_write,
+    "edit":run_edit,
+    "glob":run_glob,
+}
+
+# block传来的将是messages也就是消息列表
+def extract_text(block):
+    return "\n".join(b.content for b in block if not b.tool_calls and b.content)
+
+
+def spawn_agent(description):
+    print("[SPAWN AGENT]")
+    messages =[{"role":"user","content":description}]
+
+    for _ in range(30):
+        response = client.completions.create(
+            model = "deepseek-v4-pro",  
+            system =SUB_SYSTEM,
+            tools = SUB_TOOLS,
+            max_tokens=8000
+        )
+        meg = {"role":"assistant","content":response.choices[0].message.content}
+        if response.choices[0].message.tool_calls:
+            # 主agent用的是for循环一个个拿字典的key和value 这里直接model_dump
+            messages.tool_calls = response.choices[0].message.tool_calls.model_dump()
+        messages.append(meg)
+
+        if response.choices[0].finish_reason != "tool_calls":
+            trigger_hook("AFTER_AGENY",messages)
+            break
+
+
+        for tc in response.choices[0].message.tool_calls:
+            if not tc:
+                continue
+            blocked=trigger_hook("BEFORE_TOOL", tc)
+            arg=json.loads(tc.args)
+            output=SUB_TOOL_HANDERS[tc.name](**arg)
+            print(f"[sub] {tc.name}: {str(output)[:100]}")
+            messages.append({"role":"tool","content":output})
+    
+    result=extract_text(messages)
+    if not result:
+        for msg in reversed(messages):
+            if msg["role"]=="assistant":
+                result=msg["content"]
+                if result:
+                    break
+        if not result:
+            return "子agent在30轮对话后结束了"
+    print(f"[SUB AGENT 结束———]")
+    return result
+
+
+# =========所有工具的JSON Schema==============================================================================================
+
+# 主工具说明 
 TOOLS = [{
         "type": "function",
         "function": {
@@ -261,7 +430,24 @@ TOOLS = [{
              }
          }
      }    
-    ]
+    ,{
+        "type": "function",
+        "function": {
+         "name": "subagent",
+         "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+         "parameters": {
+             "type": "object",
+             "properties": {
+                 "description": {
+                     "type": "string",
+                     "description": "Detailed description of the subtask that subagent needs to complete"
+                 }
+             },
+             "required": ["description"]
+         }
+     }
+    }
+]
 
 
 TOOL_HANDERS = {
@@ -270,12 +456,9 @@ TOOL_HANDERS = {
     "write":run_write,
     "edit":run_edit,
     "glob":run_glob,
-    "todo_write":run_todo_write
+    "todo_write":run_todo_write,
+    "subagent":spawn_agent
 }
-
-
-
-
 
 
 #========防止模型越级操作=================================================================================================
