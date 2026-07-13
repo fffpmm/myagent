@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import subprocess
@@ -8,7 +9,10 @@ from pathlib import Path
 
 
 load_dotenv(override=True)
+#给s3用
 WORKDIR = Path.cwd()
+#给s4用
+CURRENT_TODOS:list[dict]=[]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
@@ -19,7 +23,7 @@ client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
 
 
 
-
+#============工具函数=================================================================================================
 def run_bash(command:str):
     # dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     # if any(a in command for a in dangerous):
@@ -79,7 +83,56 @@ def run_glob(patten:str):
          return "\n".join(result) if result else "(no matches)"
     except Exception as e:
         return f"Error: {e}"
-                 
+
+
+
+#========模型调用工具函数（提醒模型类不进行外部操作）======================================================================
+
+# 对todos的消息类型进行检测 只要列表里是字典的   todos这个参数也是像其他工具函数一样的由大模型定义给它
+def _normalize_todos(todos):
+    if isinstance(todos,str):
+        try:
+            todos =json.loads(todos)
+        except json.JSONDecodeError:
+            try:
+                todos = ast.literal_eval(todos)
+            except (SyntaxError,ValueError):
+                return None,"error:todos 参数格式错误"
+    if not isinstance(todos,list):
+        return None,"error:todos 列表格式错误"
+    for i,g in enumerate(todos):
+        if not isinstance(g,dict):
+            return None,f"error:todos[{i}]的必须是一个字典"
+        if "content" not in g or "status" not in g:
+            return None,f"error:todos[{i}]可能缺少content或status"
+        if g["status"] not in ("pending","in_progress","completed"):
+            return None,f"error:todos[{i}]未设定状态"
+    return todos,None
+
+#为状态添加上符号并打印出每个任务的状态  todos这个参数也是像其他工具函数一样的由大模型定义给它
+def run_todo_write(todos:list):
+    global CURRENT_TODOS
+    todos_ture,error = _normalize_todos(todos)
+    if error:
+        return error
+    CURRENT_TODOS = todos_ture
+    lines=["\n\n##当前的任务"]
+    icon_map ={
+        "pending":"",
+        "in_progress":"▶",
+        "completed":"✔"
+    }
+    for todo_item in CURRENT_TODOS:
+        status_icon = icon_map[todo_item["status"]]
+        task_text = todo_item["content"]
+        lines.append(f"{status_icon} {task_text}")
+    print("\n".join(lines))
+    return f"更新了{len(CURRENT_TODOS)}个任务"
+        
+
+
+
+
 
 TOOLS = [{
         "type": "function",
@@ -179,7 +232,36 @@ TOOLS = [{
                 }
             }
         }
-    }]
+    },
+    {
+        "type": "function",
+         "function": {
+             "name": "todo_write",
+             "description": "更新全部待办任务清单",
+             "parameters": {
+                 "type": "object",
+                 "required": ["todos"],
+                 "properties": {
+                     "todos": {
+                         "type": "array",
+                         "items": {
+                             "type": "object",
+                             "required": ["content", "status"],
+                             "properties": {
+                                 "content": {"type": "string", "description": "待办任务描述文本"},
+                                 "status": {
+                                     "type": "string",
+                                     "enum": ["pending", "in_progress", "completed"],
+                                     "description": "任务状态：待处理/进行中/已完成"
+                                 }
+                             }
+                         }
+                     }
+                 }
+             }
+         }
+     }    
+    ]
 
 
 TOOL_HANDERS = {
@@ -187,7 +269,8 @@ TOOL_HANDERS = {
     "read":run_read,
     "write":run_write,
     "edit":run_edit,
-    "glob":run_glob
+    "glob":run_glob,
+    "todo_write":run_todo_write
 }
 
 
@@ -269,7 +352,9 @@ def trigger_hook(event:str,*args):
             return result
     return None
 
-# 防越级操作钩子函数（三合一)  替代升级了上面的三合一的越级操作但功能一致 只是要将其注册为了钩子函数
+# <====五种钩子函数只有permission_check函数是没有触发打印的条件的但是它是由log_function钩子函数触发====>
+
+# # 防越级操作钩子函数（三合一)  替代升级了上面的三合一的越级操作但功能一致 只是要将其注册为了钩子函数
 def permission_check_hook(block):
     if block.function.name == "bash":
         args = json.loads(block.function.arguments)
@@ -291,7 +376,7 @@ def permission_check_hook(block):
     return None
 
 # 日志钩子函数 记录每一个工具的调用信息
-def log_hook(block):
+def log_function_hook(block):
     args=json.loads(block.function.arguments)
     args_preview =str(list(args.values())[:2])[:50]
     print(f"[HOOK] {block.function.name} {args_preview}")
@@ -311,22 +396,29 @@ def context_inject_hook(query:str):
     return None
 
 
-# 看钩子函数数量的钩子函数
+# 看工具调用数量的钩子函数
 def summary_hook(messages:list):
     tool_count = sum(1 for m in messages if m.get("role","") =="tool")
+    print(f"[HOOK] 工具调用数量{tool_count}")
     return None
 
 register_hook("BEFORE_AGENT",context_inject_hook)
 register_hook("BEFORE_TOOL",permission_check_hook)
-register_hook("BEFORE_TOOL",log_hook)
+register_hook("BEFORE_TOOL",log_function_hook)
 register_hook("AFTER_TOOL",large_output_hook)
 register_hook("AFTER_AGENT",summary_hook)
 
 #=========agent循环========================================================================================================  =================   
 
-
+count_todo=0
 def agent_loop(messages:list):
+    global count_todo
     while True: 
+        #<====4====>
+        if count_todo>3 and messages:
+            messages.append({"role": "user","content": f"注意请更新你的todos"})
+            count_todo=0
+
         response = client.chat.completions.create(
         model="deepseek-v4-pro",
         messages=messages,
@@ -334,10 +426,10 @@ def agent_loop(messages:list):
         max_tokens=8000
         )
     
-        # messages.append({"role":"assistant","content":response.choices[0].message.content}) 不能这样是因为openai和Claude的contennt不一样openai的message里有content和tools_calls两者是分开的而claude的content直接两者都是一个列表的
+        # <====1=====>
         assistant_msg = response.choices[0].message
         msg = {"role": "assistant", "content": assistant_msg.content}
-        # 这里就是添加content和tool_calls 判断有的话就添加
+        # 这里就是添加content和tool_calls 判断有的话就添加  先正常放入content
         if assistant_msg.tool_calls:
             msg["tool_calls"] = [
                 {"id": tc.id, "type": "function",
@@ -345,11 +437,18 @@ def agent_loop(messages:list):
                 for tc in assistant_msg.tool_calls]
         messages.append(msg)
         
-
+        # <====2=====>
+        # “分叉路口”如果没有工具调用就在此离开不然就继续进行工具的调用
         if response.choices[0].finish_reason != "tool_calls":
+            # ==钩子函数==
             trigger_hook("AFTER_AGENT", messages)
             return
-            
+
+        # 从此相当于进入到了下一轮因为它在上一步并没有离开
+        count_todo+=1
+
+
+        # <====3====>
         # arg_special是钩子函数的block args是工具函数的block参数
         for tc in response.choices[0].message.tool_calls:
             if not tc:
@@ -371,6 +470,7 @@ def agent_loop(messages:list):
                 output = handler(**args) if isinstance(args, dict) else handler(args)#单工具的调用output = run_bash(args["command"])
             else:
                 output = f"error: unknown tool {tc.function.name}"
+            # ==钩子函数==
             trigger_hook("AFTER_TOOL", arg_special, output)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})   
 
@@ -393,7 +493,7 @@ if __name__ == "__main__":
                 break
             history.append({"role":"user","content":query})
 
-
+            # ==钩子函数==
             trigger_hook("BEFORE_AGENT", query)
             agent_loop(history)
 
