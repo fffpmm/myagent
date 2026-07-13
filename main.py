@@ -1,5 +1,6 @@
 import ast
 import json
+import yaml
 import os
 import subprocess
 from openai import OpenAI
@@ -9,13 +10,16 @@ from pathlib import Path
 
 
 load_dotenv(override=True)
-#给s3用
+#给s3用 当前的工作目录
 WORKDIR = Path.cwd()
 #给s4用
 CURRENT_TODOS:list[dict]=[]
 
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
+SKILLS_DIR = Path(__file__).parent / "skills"
 
+# SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
+
+#只给主agent进行调用 subagnet就不给skill了
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
     "Complete the task you were given, then return a concise summary. "
@@ -29,9 +33,72 @@ client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com")
 
 
+#===========SKILL加载工具函数===========================================================================================
+
+#解析文件中yaml配置信息  meta（part(1）拿到就是上下---中间的内容这个内容就是简介 part（2）相当于详细内容
+def _parse_frontmatter(text):
+    if not text.startswith("---"):
+        return {},text
+    part = text.split("---",2)
+    if len(part) < 3:
+        return {},text
+    try:
+        meta = yaml.safe_load(part[1])
+    except yaml.YAMLError:
+        meta = {}
+    return meta,part[2].strip()
+    
+# 该变量就是将收集的简要信息存在这里面  到时候交给systemprompt
+SKILL_REGISTRY: dict[str, dict] = {}
+#扫描所有的skills目录下的SKILL的文件 将他的部分内容作为简介拿出构成字典到时候放入模型prompt让模型知道有那些skill
+def _scan_skills():
+    if not SKILLS_DIR.exists():
+        return
+    for d in sorted(SKILLS_DIR.iterdir()):
+        if not d.is_file():
+            continue
+        manifest = d / "SKILL.md"
+        if manifest.exists():
+            raw = manifest.read_text()
+            meta, body = _parse_frontmatter(raw)
+            name = meta.get("name", d.name)
+            name = meta.get("name", d.name)
+            desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
+            # name 方便找到想要使用的skill description方便让模型知道这个skill干啥的 content 方便想要使用时拿到skill的内容
+            SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
 
 
-#============工具函数=================================================================================================
+_scan_skills()
+
+#列出所有技能 将含所有的技能简介信息转化返回一个大的介绍技能字符串  以便放入systemprompt字符串
+def list_skills() -> str:
+    if not SKILL_REGISTRY:
+        return "(no skills found)"
+    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+
+# 建立systemprompt字符串
+def build_system() -> str:
+    catalog = list_skills()
+    return (
+        f"You are a coding agent at {WORKDIR}. "
+        f"Skills available:\n{catalog}\n"
+        "Use load_skill to get full details when needed."
+    )
+
+
+#只给主agent进行调用 subagnet就不给skill了
+SYSTEM = build_system()
+
+#<====工具函数====>  给主agent进行调用 真正让模型调用的工具函数 想要使用时传来的技能名就能拿到内容
+def load_skill(name: str) -> str:
+    """Load full skill content. Lookup via registry — no path traversal."""
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"Skill not found: {name}"
+    return skill["content"]
+
+
+#============工具函数==================================================================================================
 def run_bash(command:str):
     # dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     # if any(a in command for a in dangerous):
@@ -117,7 +184,7 @@ def _normalize_todos(todos):
             return None,f"error:todos[{i}]未设定状态"
     return todos,None
 
-#为状态添加上符号并打印出每个任务的状态  todos这个参数也是像其他工具函数一样的由大模型定义给它
+#<====工具函数====>  为状态添加上符号并打印出每个任务的状态  todos这个参数也是像其他工具函数一样的由大模型定义给它
 def run_todo_write(todos:list):
     global CURRENT_TODOS
     todos_ture,error = _normalize_todos(todos)
@@ -255,7 +322,7 @@ SUB_TOOL_HANDERS = {
 def extract_text(block):
     return "\n".join(b.content for b in block if not b.tool_calls and b.content)
 
-
+#<====工具函数====>
 def spawn_agent(description):
     print("[SPAWN AGENT]")
     messages =[{"role":"user","content":description}]
@@ -447,7 +514,25 @@ TOOLS = [{
          }
      }
     }
-]
+,{
+   "type": "function",
+   "function": {
+     "name": "load_skill",
+     "description": "Load the full content of a skill by name.",
+     "parameters": {
+       "type": "object",
+       "title": "load_skill input schema",
+       "properties": {
+         "name": {
+           "type": "string",
+           "description": "The unique name identifier of the target skill to load."
+         }
+       },
+       "required": ["name"],
+       "additionalProperties": False
+     }
+   }
+}]
 
 
 TOOL_HANDERS = {
@@ -457,7 +542,8 @@ TOOL_HANDERS = {
     "edit":run_edit,
     "glob":run_glob,
     "todo_write":run_todo_write,
-    "subagent":spawn_agent
+    "subagent":spawn_agent,
+    "load_skill":load_skill
 }
 
 
