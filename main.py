@@ -1,5 +1,6 @@
 import ast
 import json
+import time
 import yaml
 import os
 import subprocess
@@ -26,8 +27,17 @@ SUB_SYSTEM = (
     "Do not delegate further."
 )
 
+# 给一个压缩tool结果函数使用的地址 让那个过长的tool_content放入这个目录
+TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 
+# 压缩的工具调用结果放到该目录当中
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 
+"""   该agent在运行功能时会产生的系统目录与文件
+.task_outputs / tool-results/<tool_use_id>.txt
+.transcripts / transcript_<timestamp>.jsonl
+skills/<skill_name>和SKILL.md
+"""
 
 client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com")
@@ -328,8 +338,9 @@ def spawn_agent(description):
     messages =[{"role":"user","content":description}]
 
     for _ in range(30):
-        response = client.completions.create(
-            model = "deepseek-v4-pro",  
+        response = client.chat.completions.create(
+            model = "deepseek-v4-pro",
+            messages = messages,
             system =SUB_SYSTEM,
             tools = SUB_TOOLS,
             max_tokens=8000
@@ -365,6 +376,172 @@ def spawn_agent(description):
             return "子agent在30轮对话后结束了"
     print(f"[SUB AGENT 结束———]")
     return result
+# =========四层上下文消息压缩===============================================================================================
+#前三层如hook放入agent_loop里自动判断触发第四层是工具函数由模型调用
+
+#上下文消息最终限制 若多余该值会触发紧急压缩
+CONTEXT_LIMIT = 50000
+
+#作为指针压缩这个值的负数的前面tool结果
+KEEP_RECENT = 3
+
+#判断一个tool的结果是否满足这个值 若满足tool的结果则会被放进文件里
+PERSIST_THRESHOLD = 30000
+
+#放进agent_loop里所有消息大小是否触发紧急压缩
+def estimate_size(msgs): return len(str(msgs))
+
+# 判断是否是调用工具的msg
+def _message_has_tool_calls(msg):
+    if msg.get("role") != "assistant":
+        return False
+    if msg.get("tool_calls"):
+        return True
+    
+#判断是否是调用工具的
+def _is_tool_result_message(msg):
+    if msg.get("role") != "tool":
+        return False
+    return True
+
+# ====L1====  切割中间的消息
+def snip_compact(messages, max_messages=50):
+    if len(messages) <= max_messages:
+        return messages
+    # 这两个参数做切割强制保留的开头和结尾段数
+    keep_head, keep_tail = 3, max_messages - 3
+    # 这两个参数做指针
+    head_end, tail_start = keep_head, len(messages) - keep_tail
+    # 判断第三条消息是否是assistant并且调用了工具
+    if head_end > 0 and _message_has_tool_calls(messages[head_end - 1]):
+        # 如果调用了工具就往后移一个 调用了两个工具就移两个移到工具调用结束的地方
+        while head_end < len(messages) and _is_tool_result_message(messages[head_end]):
+            head_end += 1
+    #这里判断在tail_start位置有没有工具结果和这个工具结果前面没有调用工具的语句 如果有的话还要调整指针位置向前移动  但指针之间的间隔不用必须50
+    if (tail_start > 0 and tail_start < len(messages)) and _is_tool_result_message(messages[tail_start]) and _message_has_tool_calls(messages[tail_start - 1]):
+        tail_start -= 1
+    # 设置边界兜底如果没有多余消息可删
+    if head_end >= tail_start:
+        return messages
+    snipped = tail_start - head_end
+    return messages[:head_end] + [{"role": "user", "content": f"[snipped {snipped} messages]"}] + messages[tail_start:]
+
+# ====L2====  拿到所有工具结果看返回的消息内容多吗如果多的话就会直接舍弃 放进去一个说明
+# 该函数将工具结果收集起来  【结果blocks是一个列表里面是一个个元组由索引与tool的内容组成】
+def collect_tool_results(messages):
+    blocks = []
+    for mi, msg in enumerate(messages):
+        if msg.get("role") != "tool" or not isinstance(msg.get("content"), str): 
+            continue
+        msg_ture=msg["content"]
+        blocks.append((mi,msg["content"]))
+    return blocks
+
+#压缩工具结果
+def micro_compact(messages):
+    tool_results = collect_tool_results(messages)
+    if len(tool_results) <= KEEP_RECENT: 
+        return messages
+    # 拿到所有的工具结果  选择在KEEP_RECENT之前的工具结果
+    for (idx, content) in tool_results[:-KEEP_RECENT]:
+        if len(content) > 120:
+            messages[idx]["content"] = "[之前的消息结果过于紧凑]"
+    return messages
+
+# ====L3==== 压缩工具结果放入文件中
+#该函数创建目录将满足长消息写入文件
+def persist_large_output(tool_use_id, output):
+    if len(output) <= PERSIST_THRESHOLD: 
+        return output
+    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
+    if not path.exists(): 
+        path.write_text(output)
+    return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
+
+# 限制单论对话中所有tool的结果的文本总长度防止工具返回的内容过长塞满上下文 满足条件的话就把过长的话放进文件留一个地址给原来的content
+def tool_result_budget(messages, max_bytes=200_000):
+    blocks = []
+    # 从对话末尾倒着遍历，只取本轮刚返回的tool，碰到其他role立刻停止 最终将blocks列表加入所有工具的字典
+    for msg in reversed(messages):
+        if msg.get("role") != "tool":
+            break
+        # 把从后往前的tool放每回的第一个就能得到一个原有的顺序
+        blocks.insert(0, msg)  
+
+    #将每一个tool分成索引和内容变成元组放进列表  msg就是一个个字典里面是role：tool，content：内容
+    blocks = [(idx, msg) for idx, msg in enumerate(blocks)]
+    #将里面所有tool的content内容加在一起判断长度
+    total = sum(len(str(b.get("content", ""))) for _, b in blocks)
+    # 总长度没超限，直接返回原对话
+    if total <= max_bytes:
+        return messages
+
+    # key会把这个装满元组的列表直接打开放入每个元组作为p    按长度排序
+    ranked = sorted(blocks, key=lambda p: len(str(p[1].get("content", ""))), reverse=True)
+
+    for _, block in ranked:
+        # 总长度达标，停止压缩
+        if total <= max_bytes:
+            break
+        content = str(block.get("content", ""))
+        # 单条内容很短，跳过
+        if len(content) <= PERSIST_THRESHOLD:
+            continue
+        # OpenAI字段是 tool_call_id
+        tid = block.get("tool_call_id", "unknown")
+        # 原地替换这条tool消息的content（不删除消息，只替换文本）
+        block["content"] = persist_large_output(tid, content)
+        # 重新计算本轮所有工具总字符长度
+        total = sum(len(str(b.get("content", ""))) for _, b in blocks)
+
+    # 返回修改完成的对话列表
+    return messages
+
+# ====L4====  自动压缩
+# 将所有对话消息写入jsonl文件  【返回的是所有对话的jsonl文件路径】
+def write_transcript(messages):
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    # 这里time.time()返回的是float 所以可以使用int()
+    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with path.open("w") as f:
+        for msg in messages: 
+            f.write(json.dumps(msg, default=str) + "\n")
+    return path
+
+# 压缩对话ai并且作为工具被调用
+def summarize_history(messages):
+    conversation = json.dumps(messages, default=str)[:80000]
+    prompt = ("Summarize this coding-agent conversation so work can continue.\n"
+              "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
+              "4. remaining work, 5. user constraints.\nBe compact but concrete.\n\n" + conversation)
+    response = client.chat.completions.create(model="deepseek-v4-pro", messages=[{"role": "system", "content": prompt}], max_tokens=2000)
+    return "\n".join(msg.message.content for msg in response.choices if msg.message.content != None and msg.message.tool_calls == None )
+
+
+# <====ai自动压缩上下文工具函数====>     集结上两个函数功能构成这个工具函数
+def compact_history(messages):
+    transcript_path = write_transcript(messages)
+    print(f"[所有对话已保存: {transcript_path}]")
+    summary = summarize_history(messages)
+    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
+
+
+# ====L5==== 紧急处理上下文 在api错误时
+def reactive_compact(messages):
+    transcript_path = write_transcript(messages)
+    tail_start = max(0, len(messages) - 5)
+    # 判断 这个tail_start这个指针距离终点前五个的位置  是否有tool和这个tool上一句话有没有tool_calls 最终达到没有调用工具的位置
+    if (tail_start > 0 and tail_start < len(messages)
+            and _is_tool_result_message(messages[tail_start])
+            and _message_has_tool_calls(messages[tail_start - 1])):
+        tail_start -= 1
+    # 到达那里开始对上下文切片 然后放进总结ai总结函数 拿到summary  重新变成user消息
+    summary = summarize_history(messages[:tail_start])
+    return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"}, *messages[tail_start:]]
+
+
+
 
 
 # =========所有工具的JSON Schema==============================================================================================
@@ -532,7 +709,22 @@ TOOLS = [{
        "additionalProperties": False
      }
    }
-}]
+},{
+    "type": "function",
+    "function": {
+        "name": "compact",
+        "description": "Summarize earlier conversation to free context space.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string"
+                }
+            }
+        }
+    }
+}
+]
 
 
 TOOL_HANDERS = {
@@ -543,11 +735,12 @@ TOOL_HANDERS = {
     "glob":run_glob,
     "todo_write":run_todo_write,
     "subagent":spawn_agent,
-    "load_skill":load_skill
+    "load_skill":load_skill,
+    "compact":reactive_compact
 }
 
 
-#========防止模型越级操作=================================================================================================
+#========防止模型越级操作———放入钩子函数=================================================================================================
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
 
 # gata1：否定命名列表
@@ -683,6 +876,16 @@ count_todo=0
 def agent_loop(messages:list):
     global count_todo
     while True: 
+        #<====5====>
+        messages[:] = tool_result_budget(messages)    # L3: persist large results first
+        messages[:] = snip_compact(messages)          # L1: trim middle
+        messages[:] = micro_compact(messages)         # L2: old result placeholders
+
+        #该段就是截断循环拿到之前所有的对话如果超过了法制会直接调用ai压缩重新变成一条总结user消息
+        if estimate_size(messages) > CONTEXT_LIMIT:
+            print("[auto compact]")
+            messages[:] = compact_history(messages)
+
         #<====4====>
         if count_todo>3 and messages:
             messages.append({"role": "user","content": f"注意请更新你的todos"})
