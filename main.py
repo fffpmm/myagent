@@ -1,5 +1,6 @@
 import ast
 import json
+import re
 import time
 import yaml
 import os
@@ -18,7 +19,7 @@ CURRENT_TODOS:list[dict]=[]
 
 SKILLS_DIR = Path(__file__).parent / "skills"
 
-# SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
+SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain. "
 
 #只给主agent进行调用 subagnet就不给skill了
 SUB_SYSTEM = (
@@ -33,7 +34,11 @@ TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 # 压缩的工具调用结果放到该目录当中
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 
-"""   该agent在运行功能时会产生的系统目录与文件
+MEMORY_DIR = WORKDIR / ".memory"; MEMORY_DIR.mkdir(exist_ok=True)
+
+MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+
+"""   【该agent在运行功能时会产生的系统目录与文件】
 .task_outputs / tool-results/<tool_use_id>.txt
 .transcripts / transcript_<timestamp>.jsonl
 skills/<skill_name>和SKILL.md
@@ -41,6 +46,329 @@ skills/<skill_name>和SKILL.md
 
 client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com")
+
+#===========记忆功能====================================================================================================
+MEMORY_TYPES = ["user", "feedback", "project", "reference"]
+
+def extract_text_memory(response: str) -> str:
+    return response.choices[0].message.content
+
+
+#用来处理文件的数据 提取数据到变量中
+def _parse_frontmatter_memory(text: str) -> tuple[dict, str]:
+    if not text.startswith("---"):
+        return {}, text
+    # parts是列表
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    meta = {}
+    # 将frontmatter拿到也就是两个---中间的内容拿到 开始分割
+    for line in parts[1].strip().splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip()] = v.strip().strip('"').strip("'")
+    # 一个是frontmatter 一个是完整content
+    return meta, parts[2].strip()
+
+#在MEMORY_DIR也就是当前目录的.memory下构建 {name}.md文件 返回该path路径  供其他函数能够拿到里面的数据
+def write_memory_file(name: str, mem_type: str, description: str, body: str):
+    # 构建记忆文件在MEMORY_DIR下
+    slug = name.lower().replace(" ", "-").replace("/", "-")
+    filename = f"{slug}.md"
+    filepath = MEMORY_DIR / filename
+    filepath.write_text(
+        f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n")
+    _rebuild_index()
+    return filepath
+
+
+#在MEMORY_DIR下构建MEMORY.md文件
+def _rebuild_index():
+    # MEMORY_INDEX就是构建MEMORY.md文件索引的  这里先用lines接受每个上个函数构建的{name}.md文件取得name等信息传进MEMOIRY.md文件中
+    lines = []
+    for f in sorted(MEMORY_DIR.glob("*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        raw = f.read_text()
+        meta, body = _parse_frontmatter_memory(raw)
+        name = meta.get("name", f.stem)
+        desc = meta.get("description", body.split("\n")[0][:80])
+        lines.append(f"- [{name}]({f.name}) — {desc}")
+    MEMORY_INDEX.write_text("\n".join(lines) + "\n" if lines else "")
+
+
+
+# 拿取MEMORY.md文件里的内容并返回
+def read_memory_index() -> str:
+    if not MEMORY_INDEX.exists():
+        return ""
+    text = MEMORY_INDEX.read_text().strip()
+    return text if text else ""
+
+#拿取 该filename记忆文件的内容 不是MEMORY.md文件
+def read_memory_file(filename: str) -> str | None:
+    path = MEMORY_DIR / filename
+    if not path.exists():
+        return None
+    return path.read_text()
+
+
+#列出所有记忆文件除了MEMORY.md 并拿到他的数据构成一个个字典放入列表
+def list_memory_files_fetch_sourcelist() -> list[dict]:
+    result = []
+    for f in sorted(MEMORY_DIR.glob("*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        raw = f.read_text()
+        meta, body = _parse_frontmatter_memory(raw)
+        result.append({
+            "filename": f.name,
+            "name": meta.get("name", f.stem),
+            "description": meta.get("description", ""),
+            "type": meta.get("type", "user"),
+            "body": body,
+        })
+    return result
+
+#<===智能记忆检索函数===>  【根据用户对话筛选出和聊天相关记忆的文件名】  ai精准筛选和关键字兜底匹配
+def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
+    #确认该函数拿到了各个memory资源列表内是一个个字典
+    list_source = list_memory_files_fetch_sourcelist()
+    if not list_source:
+        return []
+
+    #将最近三条用户的提问提取出来 放进recent_texts列表中最后转化成recent字符串
+    recent_texts = []
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                recent_texts.append(content)
+            if len(recent_texts) >= 3:
+                break
+    recent = " ".join(reversed(recent_texts))[:2000]
+
+    #判断recent字符串存在吗
+    if not recent.strip():
+        return []
+
+    # 这里是拿到每个memory的id以及name和描述 这里id有用到时候ai返回就是指认idmemory
+    catalog_lines = []
+    for i, f in enumerate(list_source):
+        catalog_lines.append(f"{i}: {f['name']} — {f['description']}")
+    catalog = "\n".join(catalog_lines)
+
+    prompt = (
+        "Given the recent conversation and the memory catalog below, "
+        "select the indices of memories that are clearly relevant. "
+        "Return ONLY a JSON array of integers, e.g. [0, 3]. "
+        "If none are relevant, return [].\n\n"
+    )
+
+    # 上面第一个拿到前三条用户的提问消息构成recent 第二个拿到所有记忆的name和描述
+    system = (
+              f"Recent conversation:\n{recent}\n\n"
+              f"Memory catalog:\n{catalog}")
+
+    try:
+        # <===AI智能检索===>
+        response = client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            system = system
+        )
+
+        
+        # 该方法定义在subagent那里 用于拿到response的普通回答消息content不要tool_calls
+        text = extract_text_memory(response).strip()
+        # 由于给模型的要求返回数字id列表 match就是一个对象 里面是想要记忆的id列表 匹配的是[0,2]
+        match = re.search(r'\[.*?\]', text, re.DOTALL)
+        if match:
+            # 将match对象转成字符串 再转化成列表
+            indices = json.loads(match.group())
+            # 拿到列表后开始检验列表里id是否满足  满足的话就换成名字存入列表
+            selected = []
+            for idx in indices:
+                if isinstance(idx, int) and 0 <= idx < len(list_source):
+                    selected.append(list_source[idx]["filename"])
+                    if len(selected) >= max_items:
+                        break
+            return selected
+    except Exception:
+        pass
+
+        # <===关键字模糊匹配兜底===>
+        keywords = [w.lower() for w in recent.split() if len(w) > 3]
+        selected = []
+        for f in list_source:
+            text = (f["name"] + " " + f["description"]).lower()
+            if any(kw in text for kw in keywords):
+                selected.append(f["filename"])
+                if len(selected) >= max_items:
+                    break
+        return selected
+
+#将上面智能检索的记忆内容放进列表中变成字符串  【通过智能检索出来的文件名去拿到该文件的内容最后将内容放进列表转化成字符串】
+def load_memories(messages: list) -> str:
+     #这个函数返回就是memory文件名字列表
+     selected_files = select_relevant_memories(messages)
+     if not selected_files:
+        return ""
+
+     parts = ["<relevant_memories>"]
+     for filename in selected_files:
+        content = read_memory_file(filename)
+        if content:
+            parts.append(content)
+     parts.append("</relevant_memories>")
+     return "\n\n".join(parts)
+
+#<===智能记忆提取===>  【将最近十条消息和以前的消息提取成字符串合起来让ai返回规定的列表内套字典的格式然后提取出内部的数据然后创建出一个个字典对应的一个个文件】 
+def extract_memories(messages: list):
+    #<===第一步===>
+    #这里就是提取对话列表内容从倒数第10到最后一个的content连成一个"字符串"
+    dialogue_parts = []
+    for msg in messages[-10:]:
+        role = msg.get("role", "?")
+        content = msg.get("content", "")
+        if isinstance(content, str) and content.strip():
+            dialogue_parts.append(f"{role}: {content}")
+    dialogue = "\n".join(dialogue_parts)
+
+    # 判断提取出来的对话字符串是否存在
+    if not dialogue.strip():
+        return
+
+    #<===第二步===>
+    # 拿取所有记忆文件的详细列表转化成一行相当于一个文件的基本内容的"字符串"
+    existing = list_memory_files_fetch_sourcelist()
+    existing_desc = "\n".join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
+
+    system = (
+        "你是一个记忆提取助手。从对话中提取需要长期记住的新信息。\n\n"
+        "每条记忆包含四个字段：\n"
+        "1. name：简短横杠分隔命名，示例：user-preference-tabs\n"
+        "2. type：仅能选用4种值：user / feedback / project / reference\n"
+        "3. description：单行简短摘要，用于快速检索记忆\n"
+        "4. body：完整详细内容，使用Markdown格式书写\n\n"
+        "如果没有新增信息，或是内容已经存在于已有记忆中，直接返回空数组 []\n\n"
+        f"已有记忆：\n{existing_desc}\n\n"
+        f"对话内容：\n{dialogue[:4000]}"
+    )
+
+    prompt = "请根据上述对话内容，提取需要新增的记忆，返回 JSON 数组。如果没有新信息则返回 []。"
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=800,
+        )
+
+        # 拿到response的普通回答消息content
+        text = extract_text_memory(response).strip()
+        # 防止ai返回的还有文本 这个可以剔除文本只拿[]
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            return
+        items = json.loads(match.group())
+        if not items:
+            return
+
+        count = 0
+        # 提取ai被要求的json格式 并拿到里面的各个内容 将其创建一个memory文件
+        for mem in items:
+            name = mem.get("name", f"memory_{int(time.time())}")
+            mem_type = mem.get("type", "user")
+            desc = mem.get("description", "")
+            body = mem.get("body", "")
+            if desc and body:
+                write_memory_file(name, mem_type, desc, body)
+                count += 1
+        if count:
+            print(f"\n[Memory: extracted {count} new memories]")
+    except Exception:
+        pass
+
+# 最大允许提取memory文件的数量
+CONSOLIDATE_THRESHOLD = 10
+
+
+#<===智能整合老记忆文件加入新记忆文件===> 【调整当前memory文件将里面所有数据提取成字符串发给模型过时的和合并重复的重新变成一个列表内含一个个字典删去老的文件除了MEMORY创建新的文件】
+def consolidate_memories():
+    files = list_memory_files_fetch_sourcelist()
+    if len(files) < CONSOLIDATE_THRESHOLD:
+        return
+    
+    catalog = "\n\n".join(
+        f"## {f['filename']}\nname: {f['name']}\ndescription: {f['description']}\n{f['body']}"
+        for f in files
+    )
+
+    system_prompt = (
+        "整合以下记忆文件。规则：\n"
+        "1. 合并重复的记忆为一条\n"
+        "2. 删除过时或矛盾的内容\n"
+        "3. 总数控制在30条以内\n"
+        "4. 优先保留重要的用户偏好\n"
+        "返回 JSON 数组，每项：{name, type, description, body}。"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"以下是记忆文件：\n\n{catalog[:16000]}"},
+            ],
+            max_tokens=3000,
+        )
+        text = extract_text_memory(response).strip()
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            return
+        items = json.loads(match.group())
+
+        # 去除老的文件除了MEMORY.md
+        for f in MEMORY_DIR.glob("*.md"):
+            if f.name != "MEMORY.md":
+                f.unlink()
+
+        for mem in items:
+            name = mem.get("name", f"memory_{int(time.time())}")
+            mem_type = mem.get("type", "user")
+            desc = mem.get("description", "")
+            body = mem.get("body", "")
+            if desc and body:
+                write_memory_file(name, mem_type, desc, body)
+        print(f"[记忆：合并 {len(files)} → {len(items)} 条记忆]")
+    except Exception:
+        pass
+
+
+def build_memory_system() -> str:
+    index = read_memory_index()
+    memories_section = f"\n\nMemories available:\n{index}" if index else ""
+    return (
+        f"{memories_section}\n"
+        "Relevant memories are injected below. Respect user preferences from memory.\n"
+        "When the user says 'remember' or expresses a clear preference, extract it as a memory."
+    )
+
+SUB_SYSTEM = (
+    "Complete the task you were given, then return a concise summary. "
+    "Do not delegate further."
+)
+
+
+
+
+
 
 
 #===========SKILL加载工具函数===========================================================================================
@@ -57,7 +385,7 @@ def _parse_frontmatter(text):
     except yaml.YAMLError:
         meta = {}
     return meta,part[2].strip()
-    
+
 # 该变量就是将收集的简要信息存在这里面  到时候交给systemprompt
 SKILL_REGISTRY: dict[str, dict] = {}
 #扫描所有的skills目录下的SKILL的文件 将他的部分内容作为简介拿出构成字典到时候放入模型prompt让模型知道有那些skill
@@ -65,13 +393,14 @@ def _scan_skills():
     if not SKILLS_DIR.exists():
         return
     for d in sorted(SKILLS_DIR.iterdir()):
-        if not d.is_file():
+        if not d.is_dir():
             continue
+        #这个SKILL需要提出注入这个技能这个里/SKILL类似于已经有这个技能了那个变量接收这个路径而已
         manifest = d / "SKILL.md"
         if manifest.exists():
+            # 拿到SKILL.md文件里所有内容 使用_parse_frontmatter函数进行分割取到各个信息
             raw = manifest.read_text()
             meta, body = _parse_frontmatter(raw)
-            name = meta.get("name", d.name)
             name = meta.get("name", d.name)
             desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
             # name 方便找到想要使用的skill description方便让模型知道这个skill干啥的 content 方便想要使用时拿到skill的内容
@@ -87,7 +416,7 @@ def list_skills() -> str:
     return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
 
 # 建立systemprompt字符串
-def build_system() -> str:
+def build_skill_system() -> str:
     catalog = list_skills()
     return (
         f"You are a coding agent at {WORKDIR}. "
@@ -97,7 +426,7 @@ def build_system() -> str:
 
 
 #只给主agent进行调用 subagnet就不给skill了
-SYSTEM = build_system()
+SKILL_SYSTEM = build_skill_system()
 
 #<====工具函数====>  给主agent进行调用 真正让模型调用的工具函数 想要使用时传来的技能名就能拿到内容
 def load_skill(name: str) -> str:
@@ -108,7 +437,7 @@ def load_skill(name: str) -> str:
     return skill["content"]
 
 
-#============工具函数==================================================================================================
+#============核心功能工具函数==================================================================================================
 def run_bash(command:str):
     # dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     # if any(a in command for a in dangerous):
@@ -157,7 +486,7 @@ def run_edit(path:str,old_content:str,new_content:str):
         return "消息替换完成"
     except Exception as e:
         return f"error:编辑文件错误{e}"
-    
+
 #文件检索工具，让大模型通过通配符搜索项目工作目录WORKDIR的文件
 def run_glob(patten:str):
     try:
@@ -171,9 +500,9 @@ def run_glob(patten:str):
 
 
 
-#========模型调用工具函数（该工具不进行外部操作只做提醒和打印在终端）======================================================================
+#========聚焦任务目标工具函数（该工具不进行外部操作只做提醒和打印在终端）======================================================================
 
-# 对todos的消息类型进行检测 只要列表里是字典的   todos这个参数也是像其他工具函数一样的由大模型定义给它
+# 对todos的消息类型进行检测 只要列表里是字典的   todos这个参数也是像其它工具函数一样的由大模型定义给它
 def _normalize_todos(todos):
     if isinstance(todos,str):
         try:
@@ -194,7 +523,7 @@ def _normalize_todos(todos):
             return None,f"error:todos[{i}]未设定状态"
     return todos,None
 
-#<====工具函数====>  为状态添加上符号并打印出每个任务的状态  todos这个参数也是像其他工具函数一样的由大模型定义给它
+#<====工具函数====>  为状态添加上符号并打印出每个任务的状态  todos这个参数也是像其它工具函数一样的由大模型定义给它
 def run_todo_write(todos:list):
     global CURRENT_TODOS
     todos_ture,error = _normalize_todos(todos)
@@ -213,7 +542,7 @@ def run_todo_write(todos:list):
         lines.append(f"{status_icon} {task_text}")
     print("\n".join(lines))
     return f"更新了{len(CURRENT_TODOS)}个任务"
-        
+
 
 # =========子agent=====================================================================================================
 
@@ -328,8 +657,8 @@ SUB_TOOL_HANDERS = {
     "glob":run_glob,
 }
 
-# block传来的将是messages也就是消息列表
-def extract_text(block):
+# block传来的将是messages也就是消息列表 【将消息列表转化成字符串】
+def extract_text_subagent(block):
     return "\n".join(b.content for b in block if not b.tool_calls and b.content)
 
 #<====工具函数====>
@@ -348,11 +677,11 @@ def spawn_agent(description):
         meg = {"role":"assistant","content":response.choices[0].message.content}
         if response.choices[0].message.tool_calls:
             # 主agent用的是for循环一个个拿字典的key和value 这里直接model_dump
-            messages.tool_calls = response.choices[0].message.tool_calls.model_dump()
+            meg["tool_calls"] = response.choices[0].message.tool_calls.model_dump()
         messages.append(meg)
 
         if response.choices[0].finish_reason != "tool_calls":
-            trigger_hook("AFTER_AGENY",messages)
+            trigger_hook("AFTER_AGENT",messages)
             break
 
 
@@ -364,8 +693,8 @@ def spawn_agent(description):
             output=SUB_TOOL_HANDERS[tc.name](**arg)
             print(f"[sub] {tc.name}: {str(output)[:100]}")
             messages.append({"role":"tool","content":output})
-    
-    result=extract_text(messages)
+
+    result=extract_text_subagent(messages)
     if not result:
         for msg in reversed(messages):
             if msg["role"]=="assistant":
@@ -376,7 +705,7 @@ def spawn_agent(description):
             return "子agent在30轮对话后结束了"
     print(f"[SUB AGENT 结束———]")
     return result
-# =========四层上下文消息压缩===============================================================================================
+# =========五层上下文消息压缩===============================================================================================
 #前三层如hook放入agent_loop里自动判断触发第四层是工具函数由模型调用
 
 #上下文消息最终限制 若多余该值会触发紧急压缩
@@ -397,7 +726,7 @@ def _message_has_tool_calls(msg):
         return False
     if msg.get("tool_calls"):
         return True
-    
+
 #判断是否是调用工具的
 def _is_tool_result_message(msg):
     if msg.get("role") != "tool":
@@ -431,7 +760,7 @@ def snip_compact(messages, max_messages=50):
 def collect_tool_results(messages):
     blocks = []
     for mi, msg in enumerate(messages):
-        if msg.get("role") != "tool" or not isinstance(msg.get("content"), str): 
+        if msg.get("role") != "tool" or not isinstance(msg.get("content"), str):
             continue
         msg_ture=msg["content"]
         blocks.append((mi,msg["content"]))
@@ -440,7 +769,7 @@ def collect_tool_results(messages):
 #压缩工具结果
 def micro_compact(messages):
     tool_results = collect_tool_results(messages)
-    if len(tool_results) <= KEEP_RECENT: 
+    if len(tool_results) <= KEEP_RECENT:
         return messages
     # 拿到所有的工具结果  选择在KEEP_RECENT之前的工具结果
     for (idx, content) in tool_results[:-KEEP_RECENT]:
@@ -451,23 +780,23 @@ def micro_compact(messages):
 # ====L3==== 压缩工具结果放入文件中
 #该函数创建目录将满足长消息写入文件
 def persist_large_output(tool_use_id, output):
-    if len(output) <= PERSIST_THRESHOLD: 
+    if len(output) <= PERSIST_THRESHOLD:
         return output
     TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
-    if not path.exists(): 
+    if not path.exists():
         path.write_text(output)
     return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
 
 # 限制单论对话中所有tool的结果的文本总长度防止工具返回的内容过长塞满上下文 满足条件的话就把过长的话放进文件留一个地址给原来的content
 def tool_result_budget(messages, max_bytes=200_000):
     blocks = []
-    # 从对话末尾倒着遍历，只取本轮刚返回的tool，碰到其他role立刻停止 最终将blocks列表加入所有工具的字典
+    # 从对话末尾倒着遍历，只取本轮刚返回的tool，碰到其它role立刻停止 最终将blocks列表加入所有工具的字典
     for msg in reversed(messages):
         if msg.get("role") != "tool":
             break
         # 把从后往前的tool放每回的第一个就能得到一个原有的顺序
-        blocks.insert(0, msg)  
+        blocks.insert(0, msg)
 
     #将每一个tool分成索引和内容变成元组放进列表  msg就是一个个字典里面是role：tool，content：内容
     blocks = [(idx, msg) for idx, msg in enumerate(blocks)]
@@ -505,7 +834,7 @@ def write_transcript(messages):
     # 这里time.time()返回的是float 所以可以使用int()
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with path.open("w") as f:
-        for msg in messages: 
+        for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     return path
 
@@ -546,7 +875,7 @@ def reactive_compact(messages):
 
 # =========所有工具的JSON Schema==============================================================================================
 
-# 主工具说明 
+# 主工具说明
 TOOLS = [{
         "type": "function",
         "function": {
@@ -673,7 +1002,7 @@ TOOLS = [{
                  }
              }
          }
-     }    
+     }
     ,{
         "type": "function",
         "function": {
@@ -717,8 +1046,10 @@ TOOLS = [{
         "parameters": {
             "type": "object",
             "properties": {
-                "focus": {
-                    "type": "string"
+                "messages": {
+                    "type": "array",
+                    "description": "The full conversation messages list to compact",
+                    "items": {"type": "object"}
                 }
             }
         }
@@ -736,7 +1067,6 @@ TOOL_HANDERS = {
     "todo_write":run_todo_write,
     "subagent":spawn_agent,
     "load_skill":load_skill,
-    "compact":reactive_compact
 }
 
 
@@ -750,8 +1080,8 @@ def check_deny_list(command:str):
             return "error:出现了禁用命令"
     return None
 
-# gata2: 规则匹配 
-PERMISSION_ROLES=[{    
+# gata2: 规则匹配
+PERMISSION_ROLES=[{
     "tools":["write","edit"],
     "check":lambda args: not (WORKDIR/args.get("path","")).resolve().is_relative_to(WORKDIR),
     "messages":"跳出工作目录的写入或编辑操作"
@@ -870,13 +1200,32 @@ register_hook("BEFORE_TOOL",log_function_hook)
 register_hook("AFTER_TOOL",large_output_hook)
 register_hook("AFTER_AGENT",summary_hook)
 
-#=========agent循环========================================================================================================  =================   
+#=========agent循环========================================================================================================  =================
 
 count_todo=0
+
+# 看是否超过这个数值 超过了就无法在紧急压缩上下文了
+MAX_REACTIVE_RETRIES = 1
 def agent_loop(messages:list):
+    #这个参数是用来计数 达到某个数值就确定自己目标防止跑题
     global count_todo
-    while True: 
-        #<====5====>
+    #这个参数用来判断是否触发紧急压缩上下文
+    reactive_retries = 0
+
+    #<===6===>
+    #加载出所有文件中相关记忆的内容合并成的字符串
+    memories_content = load_memories(messages)
+    #len-1是为了能够下标取值刚好取到最新的消息
+    memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
+
+
+    while True:
+        #<===6===>
+        #拿到干净的对话消息不要tool_calls的
+        pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
+            "content": str(m.get("content",""))} for m in messages]
+
+        #<====5====>    
         messages[:] = tool_result_budget(messages)    # L3: persist large results first
         messages[:] = snip_compact(messages)          # L1: trim middle
         messages[:] = micro_compact(messages)         # L2: old result placeholders
@@ -891,13 +1240,35 @@ def agent_loop(messages:list):
             messages.append({"role": "user","content": f"注意请更新你的todos"})
             count_todo=0
 
-        response = client.chat.completions.create(
-        model="deepseek-v4-pro",
-        messages=messages,
-        tools=TOOLS,
-        max_tokens=8000
-        )
-    
+        #<====6====>
+        # 把长期记忆拼进用户对话中
+        request_messages = messages
+        if memories_content and memory_turn is not None and memory_turn < len(messages):
+                request_messages = messages.copy()
+                request_messages[memory_turn] = {
+                    **messages[memory_turn],
+                    "content": memories_content + "\n\n" + messages[memory_turn]["content"],
+                }
+
+        try:
+            response = client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=request_messages,
+            tools=TOOLS,
+            max_tokens=8000
+            )
+            reactive_retries = 0  # reset on successful API call
+        except Exception as e:
+            # <====5====>
+            # 这里是触发紧急压缩 之前的消息只会保留最后五个和加上总结的消息
+            if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
+                print("[reactive compact]")
+                messages[:] = reactive_compact(messages)
+                reactive_retries += 1
+                continue
+            raise
+
+
         # <====1=====>
         assistant_msg = response.choices[0].message
         msg = {"role": "assistant", "content": assistant_msg.content}
@@ -908,32 +1279,53 @@ def agent_loop(messages:list):
                  "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                 for tc in assistant_msg.tool_calls]
         messages.append(msg)
-        
+
         # <====2=====>
-        # “分叉路口”如果没有工具调用就在此离开不然就继续进行工具的调用
+        # "分叉路口"如果没有工具调用就在此离开不然就继续进行工具的调用
         if response.choices[0].finish_reason != "tool_calls":
             # ==钩子函数==
             trigger_hook("AFTER_AGENT", messages)
+            
+            # <====6=====>
+            # ==触发记忆函数==
+            # 第一个是创建新的多个memory文件 第二个整合删去老的重复的创建新的
+            extract_memories(pre_compress)
+            consolidate_memories()
             return
+
 
         # 从此相当于进入到了下一轮因为它在上一步并没有离开
         count_todo+=1
 
-
+        
+     
+        
+        results = []
         # <====3====>
         # arg_special是钩子函数的block args是工具函数的block参数
         for tc in response.choices[0].message.tool_calls:
+            # <====5=====><====3====>虽然介绍了函数但没有在tool_handler中定义
+            if tc.name == "compact":
+                messages[:] = compact_history(messages)
+                results.append({"type": "tool_result", "tool_use_id": tc.id,
+                                "content": "[Compacted. Conversation history has been summarized.]"})
+                messages.append({"role": "user", "content": results})
+                break  # end current turn, start fresh with compacted context
+            
+            #如果没有函数调用看一下
             if not tc:
                 continue
+
+
             arg_special=tc
             # ==钩子函数== 虽然接受钩子函数的返回值并写入tool里面但是这些钩子函数都没有返回值
             blocked=trigger_hook("BEFORE_TOOL", arg_special)
             if blocked:
                 messages.append({"role":"tool","content":blocked})
                 continue
-        
-    
-        
+
+
+
             #==进行工具调用handler==  调用工具就是把模型想要工具参数放进函数里，里面都是自动化开始处理
             handler = TOOL_HANDERS.get(tc.function.name)
             arg_special=tc
@@ -944,18 +1336,23 @@ def agent_loop(messages:list):
                 output = f"error: unknown tool {tc.function.name}"
             # ==钩子函数==
             trigger_hook("AFTER_TOOL", arg_special, output)
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})   
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 
-        
 
-    
- 
+
+
 
 
 if __name__ == "__main__":
     #history进agent_loop相当于变成messages了所以append都会进入到history
     history = []
-    history.append({"role":"system","content":SYSTEM})
+
+    memory_system=build_memory_system()
+    skill_system=build_skill_system() + SYSTEM
+    system = memory_system + skill_system 
+    history.append({"role":"system","content":system})
+
+
     while True:
             try:
                 query=input("请输入消息(exit和quit是退出程序)：")
@@ -970,4 +1367,4 @@ if __name__ == "__main__":
             agent_loop(history)
 
             print(history)
-            
+
