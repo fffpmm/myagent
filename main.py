@@ -19,7 +19,8 @@ CURRENT_TODOS:list[dict]=[]
 
 SKILLS_DIR = Path(__file__).parent / "skills"
 
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain. "
+#这个__main__中配合 build_skill_system和build_memory_system使用
+#SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain. "
 
 #只给主agent进行调用 subagnet就不给skill了
 SUB_SYSTEM = (
@@ -46,6 +47,9 @@ skills/<skill_name>和SKILL.md
 
 client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com")
+
+
+
 
 #===========记忆功能====================================================================================================
 MEMORY_TYPES = ["user", "feedback", "project", "reference"]
@@ -175,9 +179,11 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
         # <===AI智能检索===>
         response = client.chat.completions.create(
             model="deepseek-v4-pro",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
             max_tokens=200,
-            system = system
         )
 
         
@@ -225,7 +231,7 @@ def load_memories(messages: list) -> str:
      parts.append("</relevant_memories>")
      return "\n\n".join(parts)
 
-#<===智能记忆提取===>  【将最近十条消息和以前的消息提取成字符串合起来让ai返回规定的列表内套字典的格式然后提取出内部的数据然后创建出一个个字典对应的一个个文件】 
+#<===智能记忆提取===>  【将最近十条消息和以前的消息记忆文件提取成字符串合起来让ai返回规定的列表内套字典的格式然后提取出内部的数据然后创建出一个个字典对应的一个个文件】 
 def extract_memories(messages: list):
     #<===第一步===>
     #这里就是提取对话列表内容从倒数第10到最后一个的content连成一个"字符串"
@@ -359,12 +365,6 @@ def build_memory_system() -> str:
         "Relevant memories are injected below. Respect user preferences from memory.\n"
         "When the user says 'remember' or expresses a clear preference, extract it as a memory."
     )
-
-SUB_SYSTEM = (
-    "Complete the task you were given, then return a concise summary. "
-    "Do not delegate further."
-)
-
 
 
 
@@ -664,13 +664,15 @@ def extract_text_subagent(block):
 #<====工具函数====>
 def spawn_agent(description):
     print("[SPAWN AGENT]")
-    messages =[{"role":"user","content":description}]
+    messages =[
+        {"role": "system", "content": SUB_SYSTEM},
+        {"role": "user", "content": description}
+    ]
 
     for _ in range(30):
         response = client.chat.completions.create(
             model = "deepseek-v4-pro",
             messages = messages,
-            system =SUB_SYSTEM,
             tools = SUB_TOOLS,
             max_tokens=8000
         )
@@ -705,8 +707,12 @@ def spawn_agent(description):
             return "子agent在30轮对话后结束了"
     print(f"[SUB AGENT 结束———]")
     return result
+
+
 # =========五层上下文消息压缩===============================================================================================
 #前三层如hook放入agent_loop里自动判断触发第四层是工具函数由模型调用
+# $$注意在l4和l5的时候会将system消息也给压缩了 所以要注意补上 已经在agent__loop补上了
+
 
 #上下文消息最终限制 若多余该值会触发紧急压缩
 CONTEXT_LIMIT = 50000
@@ -849,7 +855,7 @@ def summarize_history(messages):
 
 
 # <====ai自动压缩上下文工具函数====>     集结上两个函数功能构成这个工具函数
-def compact_history(messages):
+def compact_history_tool(messages):
     transcript_path = write_transcript(messages)
     print(f"[所有对话已保存: {transcript_path}]")
     summary = summarize_history(messages)
@@ -857,7 +863,7 @@ def compact_history(messages):
 
 
 # ====L5==== 紧急处理上下文 在api错误时
-def reactive_compact(messages):
+def emergency_compact(messages):
     transcript_path = write_transcript(messages)
     tail_start = max(0, len(messages) - 5)
     # 判断 这个tail_start这个指针距离终点前五个的位置  是否有tool和这个tool上一句话有没有tool_calls 最终达到没有调用工具的位置
@@ -1069,6 +1075,74 @@ TOOL_HANDERS = {
     "load_skill":load_skill,
 }
 
+#===========动态构成system prompt======================================================================================
+"""
+updata_context就是负责看消息列表判断需不需要加上memoies的参数也就是MEMORY里的内容 返回context 
+然后用get_system_prompt来看名不命中缓存如果命中还用上一次的prompt也就是_last_prompt若没有命中的话嗲
+用assemble_system_prompt重新组装prompt变成_last_prompt被用作系统提示词
+"""
+
+PROMPT_SECTIONS = {
+    "identity": "You are a coding agent. Act, don't explain.",
+    "tools": "Available tools: bash, read_file, write_file.",
+    "workspace": f"Working directory: {WORKDIR}",
+    "memory": "Relevant memories are injected below when available.",
+}
+
+# 组装系统prompt    【看是否有memories内容有的话就放进去】
+def assemble_system_prompt(context: dict) -> str:
+    sections = []
+
+    # 将预备好的内容先放入列表中
+    sections.append(PROMPT_SECTIONS["identity"])
+    sections.append(PROMPT_SECTIONS["tools"])
+    sections.append(PROMPT_SECTIONS["workspace"])
+
+    # 如果context有memory就放入列表中
+    memories = context.get("memories", "")
+    if memories:
+        sections.append(f"Relevant memories:\n{memories}")
+
+    return "\n\n".join(sections)
+
+_last_context_key = None
+_last_prompt = None
+
+# 判断updata_context拿到context  【跟据拿到的context是否命中缓存来获取新的还是老的prompt】
+def get_system_prompt(context: dict) -> str:
+    global _last_context_key, _last_prompt
+    
+    # 将context转换成json字符串作为缓存的key
+    key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
+    if key == _last_context_key and _last_prompt:
+        print("[cache hit] system prompt unchanged")
+        return _last_prompt
+    
+    # 没命中的话就将context等于key 以便于下次命中
+    _last_context_key = key
+    # 若命中就根据这次context拼接出prompt
+    _last_prompt = assemble_system_prompt(context)
+
+    loaded = ["identity", "tools", "workspace"]
+    if context.get("memories"):
+        loaded.append("memory")
+    print(f"[assembled] sections: {', '.join(loaded)}")
+    return _last_prompt
+
+# 返回的就是context  【每次调用直接拿到的是MEMORY的内容也就是所有记忆文件的结合】
+def update_context(context: dict) -> dict:
+    memories = ""
+    if MEMORY_INDEX.exists():
+        content = MEMORY_INDEX.read_text().strip()
+        if content:
+            memories = content
+    return {
+        "enabled_tools": list(TOOL_HANDERS.keys()),
+        "workspace": str(WORKDIR),
+        "memories": memories,
+    }
+
+
 
 #========防止模型越级操作———放入钩子函数=================================================================================================
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
@@ -1206,9 +1280,11 @@ count_todo=0
 
 # 看是否超过这个数值 超过了就无法在紧急压缩上下文了
 MAX_REACTIVE_RETRIES = 1
-def agent_loop(messages:list):
+def agent_loop(messages:list,context):
+
     #这个参数是用来计数 达到某个数值就确定自己目标防止跑题
     global count_todo
+
     #这个参数用来判断是否触发紧急压缩上下文
     reactive_retries = 0
 
@@ -1217,6 +1293,16 @@ def agent_loop(messages:list):
     memories_content = load_memories(messages)
     #len-1是为了能够下标取值刚好取到最新的消息
     memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
+
+    # <===7===>
+    # 加入系统提示词  根据context  每轮agent_loop循环一次，重新生成一次看是否命中缓存
+    system = get_system_prompt(context)
+    if not messages or messages[0].get("role") != "system" or messages[0]["content"] != system:
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system
+        else:
+            messages.insert(0, {"role": "system", "content": system})
+    
 
 
     while True:
@@ -1233,7 +1319,9 @@ def agent_loop(messages:list):
         #该段就是截断循环拿到之前所有的对话如果超过了法制会直接调用ai压缩重新变成一条总结user消息
         if estimate_size(messages) > CONTEXT_LIMIT:
             print("[auto compact]")
-            messages[:] = compact_history(messages)
+            messages[:] = compact_history_tool(messages)
+            if not messages or messages[0].get("role") != "system":
+                messages.insert(0, {"role": "system", "content": system})
 
         #<====4====>
         if count_todo>3 and messages:
@@ -1241,7 +1329,7 @@ def agent_loop(messages:list):
             count_todo=0
 
         #<====6====>
-        # 把长期记忆拼进用户对话中
+        # 把长期记忆拼进用户对话中  如果满足触发条件
         request_messages = messages
         if memories_content and memory_turn is not None and memory_turn < len(messages):
                 request_messages = messages.copy()
@@ -1263,7 +1351,10 @@ def agent_loop(messages:list):
             # 这里是触发紧急压缩 之前的消息只会保留最后五个和加上总结的消息
             if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
                 print("[reactive compact]")
-                messages[:] = reactive_compact(messages)
+                # *紧急压缩但他会把system也压缩掉所以在这里补上
+                messages[:] = emergency_compact(messages)
+                if not messages or messages[0].get("role") != "system":
+                    messages.insert(0, {"role": "system", "content": system})
                 reactive_retries += 1
                 continue
             raise
@@ -1289,6 +1380,8 @@ def agent_loop(messages:list):
             # <====6=====>
             # ==触发记忆函数==
             # 第一个是创建新的多个memory文件 第二个整合删去老的重复的创建新的
+            # 上面定义的时候只能拿到到提问的时候内容在这里把模型回复的消息加上
+            pre_compress.append(response.choices[0].message.content)
             extract_memories(pre_compress)
             consolidate_memories()
             return
@@ -1304,12 +1397,17 @@ def agent_loop(messages:list):
         # <====3====>
         # arg_special是钩子函数的block args是工具函数的block参数
         for tc in response.choices[0].message.tool_calls:
+
+
             # <====5=====><====3====>虽然介绍了函数但没有在tool_handler中定义
             if tc.name == "compact":
-                messages[:] = compact_history(messages)
+                messages[:] = compact_history_tool(messages)
                 results.append({"type": "tool_result", "tool_use_id": tc.id,
                                 "content": "[Compacted. Conversation history has been summarized.]"})
                 messages.append({"role": "user", "content": results})
+                # *紧急压缩但他会把system也压缩掉所以在这里补上
+                if not messages or messages[0].get("role") != "system":
+                    messages.insert(0, {"role": "system", "content": system})
                 break  # end current turn, start fresh with compacted context
             
             #如果没有函数调用看一下
@@ -1337,8 +1435,8 @@ def agent_loop(messages:list):
             # ==钩子函数==
             trigger_hook("AFTER_TOOL", arg_special, output)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
-
-
+        
+        
 
 
 
@@ -1347,11 +1445,15 @@ if __name__ == "__main__":
     #history进agent_loop相当于变成messages了所以append都会进入到history
     history = []
 
+    """
     memory_system=build_memory_system()
     skill_system=build_skill_system() + SYSTEM
     system = memory_system + skill_system 
     history.append({"role":"system","content":system})
+    """
 
+    
+    context = update_context({})
 
     while True:
             try:
@@ -1361,10 +1463,12 @@ if __name__ == "__main__":
             if query.lower().strip() in ["exit" ,"quit",""]:
                 break
             history.append({"role":"user","content":query})
+            
 
             # ==钩子函数==
             trigger_hook("BEFORE_AGENT", query)
-            agent_loop(history)
+            agent_loop(history,context)
+            context = update_context(context)
 
             print(history)
 
