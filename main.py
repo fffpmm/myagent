@@ -44,9 +44,7 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
 PRIMARY_MODEL = "deepseek-v4-pro"
 
-FALLBACK_MODEL_ID = "deepseek-v4"
-
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
+FALLBACK_MODEL = "deepseek-v4"
 
 """   【该agent在运行功能时会产生的系统目录与文件】
 .task_outputs / tool-results/<tool_use_id>.txt
@@ -165,7 +163,7 @@ def is_prompt_too_long_error(e: Exception) -> bool:
             or "max_context_window" in msg)
 
 
-def reactive_compact(messages: list) -> list:
+def error_recovey_energency_compact(messages: list) -> list:
     """应急精简对话历史，解决上下文超长问题"""
     print(" [reactive compact] trimming to last 5 messages")
     tail = messages[-5:]
@@ -1475,8 +1473,8 @@ def agent_loop(messages:list,context):
 
         try:
 
-            #<====1====><====8====>
-            #在调用模型上加入429和529错误重试
+            #<====1====><====8====PATH3>
+            #429 和 529 统一走指数退避 + 抖动：第一次等 0.5 秒，第二次等 1 秒，第三次等 2 秒，最多 10 次。加随机抖动让并发请求不在同一时刻重试。连续 3 次 529 过载 → 切换到备用模型
             response = with_retry(lambda mt=max_tokens ,mdl=state.CURRENT_MODEL:client.chat.completions.create(
             model=mdl,
             messages=request_messages,
@@ -1486,39 +1484,42 @@ def agent_loop(messages:list,context):
             reactive_retries = 0  # reset on successful API call
         
         except Exception as e:
-            # <====5====>
-            # 这里是触发紧急压缩 之前的消息只会保留最后五个和加上总结的消息
-            if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
-                print("[reactive compact]")
-                # *紧急压缩但他会把system也压缩掉所以在这里补上
-                messages[:] = emergency_compact(messages)
-                if not messages or messages[0].get("role") != "system":
-                    messages.insert(0, {"role": "system", "content": system})
-                reactive_retries += 1
-                continue
-            raise
-
-            # <====8====>
+            
+            # <====8====PATH2>
+            # 四层压缩都无法进行的话 就触发这里的解决
             # error recovery  如果经过紧急压缩还是不行的话就会触发error recovery
             if is_prompt_too_long_error(e):
                 if not state.has_attempted_reactive_compact:
-                    messages[:] = reactive_compact(messages)
+                    messages[:] = error_recovey_energency_compact(messages)
                     state.has_attempted_reactive_compact = True
                     continue
                 print("[unrecoverable] still too long after compact")
                 messages.append({"role":"assistant","content":"[Error] Context too large, cannot continue."})
                 return
 
-                #错误无法covery
-                name = type(e).__name__
-                print(f"[unrecoverable] {name}: {str(e)[:100]}")
-                messages.append({"role": "assistant", "content":f"[Error] {name}: {str(e)[:200]}"})
-                return
+            #错误无法covery
+            name = type(e).__name__
+            print(f"[unrecoverable] {name}: {str(e)[:100]}")
+            messages.append({"role": "assistant", "content":f"[Error] {name}: {str(e)[:200]}"})
+            return
 
-        #<====2====><====8====>
+            # # <====5====>
+            # # 这里是触发紧急压缩 之前的消息只会保留最后五个和加上总结的消息
+            # if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
+            #     print("[reactive compact]")
+            #     # *紧急压缩但他会把system也压缩掉所以在这里补上
+            #     messages[:] = emergency_compact(messages)
+            #     if not messages or messages[0].get("role") != "system":
+            #         messages.insert(0, {"role": "system", "content": system})
+            #     reactive_retries += 1
+            #     continue
+            # raise
+
+
+        #<====2====><====8====PATH1>
+        #第一次发生时，直接把 max_tokens 从 8K 升级到64K(8倍空间),重试同一请求——此时不追加截断输出到 messages，保持原始请求不变。如果 64K 还是不够，才保存截断输出并注入续写提示让模型接着刚才的话继续说，最多 3 次
         #如果模型返回的max_tokens触发了就不会再走下面的将response消息添加到messages中 所以在这里就要添加了
-        #【如果触发了max_tokens模型停止 先判段是否出发了增加token处理没有的话先扩大token继续重试，若重试次数超过3次则直接返回退出】
-        if response.finish_reason == "max_tokens":
+        if response.choices[0].finish_reason == "max_tokens":
             if not state.has_escalated:
                 max_tokens = ESCALATED_MAX_TOKENS
                 state.has_escalated = True
@@ -1526,7 +1527,7 @@ def agent_loop(messages:list,context):
                       f" {DEFAULT_MAX_TOKENS} -> {ESCALATED_MAX_TOKENS}")
                 continue
             # 64K still truncated: save truncated output + continuation prompt
-            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "assistant", "content": response.choices[0].messages.content})
             if state.recovery_count < MAX_RECOVERY_RETRIES:
                 messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                 state.recovery_count += 1
@@ -1549,6 +1550,7 @@ def agent_loop(messages:list,context):
                  "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                 for tc in assistant_msg.tool_calls]
         messages.append(msg)
+
 
         # <====2=====>
         # "分叉路口"如果没有工具调用就在此离开不然就继续进行工具的调用
