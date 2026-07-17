@@ -1,4 +1,5 @@
 import ast
+from dataclasses import asdict, dataclass
 import json
 import random
 import re
@@ -54,6 +55,178 @@ skills/<skill_name>和SKILL.md
 
 client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com")
+
+#==========持久化任务系统==============================================================================================================
+TASKS_DIR = WORKDIR / ".tasks"
+TASKS_DIR.mkdir(exist_ok=True)
+
+
+@dataclass
+class Task:
+    id: int
+    #相当于简介
+    subject: str
+    description: str
+    status: str          # pending | in_progress | completed
+    owner: str | None    # Agent name (multi-agent scenarios)
+    #列表里面存放的都是前置任务的task_id
+    blockedBy: list[str] 
+#创建任务文件路径
+def _task_path(task_id: str) -> Path:
+    return TASKS_DIR / f"{task_id}.json"
+#实例化任务对象并存入json文件 【第三个函数使用第一个函数功能第二个函数使用第三个函数功能达到闭环】
+def create_task(subject: str, description: str = "",
+                blockedBy: list[str] | None = None) -> Task:
+    task = Task(
+        # 生成任务id time.time()生成时间戳 从1970到现在总秒数带小数所以int()
+        id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
+        subject=subject,
+        description=description,
+        status="pending",
+        owner=None,
+        blockedBy=blockedBy or [],
+    )
+    save_task(task)
+    return task
+
+#  下面几乎都能创建文件
+#将task对象内容转成字典再转成json字符串存入json文件 为上面函数服务
+def save_task(task: Task):
+    """将task对象转成字典并保存为json文件 会顺便创建文件"""
+    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
+
+#加载单个任务对象 【根据id从任务文件加载任务对象】
+def load_task(task_id: str) -> Task:
+    """返回task对象  会顺便创建文件"""
+    return Task(**json.loads(_task_path(task_id).read_text()))
+
+#加载所有任务对象
+def list_tasks() -> list[Task]:
+    """返回task对象列表"""
+    return [Task(**json.loads(p.read_text()))
+            for p in sorted(TASKS_DIR.glob("task_*.json"))]
+
+#获取单个任务对象详情 返回的json字符串
+def get_task(task_id: str) -> str:
+    """返回该指定task_id的任务详情 完整的一个json字符串"""
+    task = load_task(task_id)
+    return json.dumps(asdict(task), indent=2)
+
+#【判断任务能否启动】
+def can_start(task_id: str) -> bool:
+    """
+    校验当前任务所有前置依赖(blockedBy里任务)是否完成
+    1.读取当前任务
+    2.遍历每一个依赖任务task_id 
+        如果以来任务json文件不存在当前任务不能启动返回false
+        如果依赖任务状态不是completed不能启动返回false
+    3.所有依赖任务完成返回true代表任务可以执行
+    """
+    task = load_task(task_id)
+    for dep_id in task.blockedBy:
+        if not _task_path(dep_id).exists():
+            return False
+        if load_task(dep_id).status != "completed":
+            return False
+    return True
+
+#【申请，认领任务】
+def claim_task(task_id: str, owner: str = "agent") -> str:
+    """
+    认领任务
+    1.读取当前任务
+    2.校验任务状态：只有pending才能认领，已完成就拒绝认领
+    3.调用can_start再次校验依赖,依赖没就绪就返回阻塞信息不让认领 相当于这个函数里返回false就代表了不让认领 如已完成和路径不存在   
+    4.校验通过:给任务绑定owner(哪个agent接手),状态改成in_progress,保存任务
+    5.返回认领成功信息
+
+    通俗易懂:agent接活,确认活没人做,前置条件满足后,把活揽到自己身上开始做
+    """
+
+    task = load_task(task_id)
+    if task.status != "pending":
+        return f"Task {task_id} is {task.status}, cannot claim"
+    if not can_start(task_id):
+        deps = [d for d in task.blockedBy
+                if not _task_path(d).exists() or load_task(d).status != "completed"]
+        return f"Blocked by: {deps}"
+    task.owner = owner
+    task.status = "in_progress"
+    save_task(task)
+    
+    print("[claim] {task.subject} → in_progress (owner: {owner})")
+    return f"Claimed {task.id} ({task.subject})"
+
+#【完成任务,解锁下游依赖函数】
+def complete_task(task_id: str) -> str:
+    """
+    1.读取当前任务
+    2.校验状态：只有in_progress才能完成
+    3.完成任务:修改任务状态为completed,保存任务
+    4.遍历全部任务:筛选状态是pending且依赖包含刚完成的任务,现在依赖全部满足的下游任务,存入unblcked列表
+
+    通俗理解:做完手头任务后,系统检查那些卡在这个任务后面的工作现在可以开工了,把这些可开工的任务汇总通知调度器
+    """
+    task = load_task(task_id)
+    if task.status != "in_progress":
+        return f"Task {task_id} is {task.status}, cannot complete"
+    task.status = "completed"
+    save_task(task)
+
+    #都是用来拿到后面所有任务弄成字符串通知可以开始了
+    unblocked = [t.subject for t in list_tasks()
+                 if t.status == "pending" and t.blockedBy and can_start(t.id)]
+    print(f"[complete] {task.subject} ✓")
+    msg = f"Completed {task.id} ({task.subject})"
+    if unblocked:
+        msg += f"\nUnblocked: {', '.join(unblocked)}"
+        print(f"[unblocked] {', '.join(unblocked)}")
+    return msg
+
+
+#==== 定义task工具 =====
+#run_create_task和run_list_tasks,run_get_task工具相当于是 "读"
+
+#<====== 创建任务 ======>
+def run_create_task(subject: str, description: str = "",
+                    blockedBy: list[str] | None = None) -> str:
+    task = create_task(subject, description, blockedBy)
+    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
+    print(f" [create] {task.subject}{deps}")
+    return f"Created {task.id}: {task.subject}{deps}"
+
+#<====== 列出所有任务 ======>
+def run_list_tasks() -> str:
+    tasks = list_tasks()
+    if not tasks:
+        return "No tasks. Use create_task to add some."
+    lines = []
+    for t in tasks:
+        icon = {"pending": "○", "in_progress": "●",
+                "completed": "✓"}.get(t.status, "?")
+        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
+        owner = f" [{t.owner}]" if t.owner else ""
+        lines.append(f"  {icon} {t.id}: {t.subject} "
+                     f"[{t.status}]{owner}{deps}")
+    return "\n".join(lines)
+
+#<======= 获取单个任务详情 ======>
+def run_get_task(task_id: str) -> str:
+    try:
+        return get_task(task_id)
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+#<======== 认领任务 ======>
+def run_claim_task(task_id: str) -> str:
+    return claim_task(task_id, owner="agent")
+
+#<======== 完成任务 ======>
+def run_complete_task(task_id: str) -> str:
+    return complete_task(task_id)
+
+
+
 
 
 #==========模型调用错误处理机制====================================================================================================
@@ -170,8 +343,6 @@ def error_recovey_energency_compact(messages: list) -> list:
     return [{"role": "user",
              "content": "[Reactive compact] Earlier conversation trimmed. "
                         "Continue from where you left off."}, *tail]
-
-
 
 
 
@@ -553,9 +724,8 @@ def build_skill_system() -> str:
 #只给主agent进行调用 subagnet就不给skill了
 SKILL_SYSTEM = build_skill_system()
 
-#<====工具函数====>  给主agent进行调用 真正让模型调用的工具函数 想要使用时传来的技能名就能拿到内容
+#<====== 工具函数 ======>  给主agent进行调用 真正让模型调用的工具函数 想要使用时传来的技能名就能拿到内容
 def load_skill(name: str) -> str:
-    """Load full skill content. Lookup via registry — no path traversal."""
     skill = SKILL_REGISTRY.get(name)
     if not skill:
         return f"Skill not found: {name}"
@@ -626,6 +796,7 @@ def run_glob(patten:str):
 
 
 #========聚焦任务目标工具函数（该工具不进行外部操作只做提醒和打印在终端）======================================================================
+# TodoWrite 是当前任务的执行清单，保存在会话内存中
 
 # 对todos的消息类型进行检测 只要列表里是字典的   todos这个参数也是像其它工具函数一样的由大模型定义给它
 def _normalize_todos(todos):
@@ -648,7 +819,7 @@ def _normalize_todos(todos):
             return None,f"error:todos[{i}]未设定状态"
     return todos,None
 
-#<====工具函数====>  为状态添加上符号并打印出每个任务的状态  todos这个参数也是像其它工具函数一样的由大模型定义给它
+#<======工具函数  ====>  为状态添加上符号并打印出每个任务的状态  todos这个参数也是像其它工具函数一样的由大模型定义给它
 def run_todo_write(todos:list):
     global CURRENT_TODOS
     todos_ture,error = _normalize_todos(todos)
@@ -771,7 +942,7 @@ SUB_TOOLS = [{
             }
         }
     },
-    ]
+]
 
 
 SUB_TOOL_HANDERS = {
@@ -786,7 +957,7 @@ SUB_TOOL_HANDERS = {
 def extract_text_subagent(block):
     return "\n".join(b.content for b in block if not b.tool_calls and b.content)
 
-#<====工具函数====>
+#<====== 工具函数 ======>
 def spawn_agent(description):
     print("[SPAWN AGENT]")
     messages =[
@@ -979,7 +1150,7 @@ def summarize_history(messages):
     return "\n".join(msg.message.content for msg in response.choices if msg.message.content != None and msg.message.tool_calls == None )
 
 
-# <====ai自动压缩上下文工具函数====>     集结上两个函数功能构成这个工具函数
+# <====== ai自动压缩上下文工具函数 ======>     集结上两个函数功能构成这个工具函数
 def compact_history_tool(messages):
     transcript_path = write_transcript(messages)
     print(f"[所有对话已保存: {transcript_path}]")
@@ -1186,7 +1357,101 @@ TOOLS = [{
         }
     }
 }
-]
+,{
+
+    {
+        "type": "function",
+        "function": {
+            "name": "run_create_task",
+            "description": "创建新任务，可指定前置依赖任务，生成任务文件存入本地",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "任务简短标题/主题"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "任务详细需求描述",
+                        "default": ""
+                    },
+                    "blockedBy": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "前置依赖任务id列表，这些任务全部完成后当前任务才可执行，无依赖则不传",
+                        "default": []
+                    }
+                },
+                "required": ["subject"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_list_tasks",
+            "description": "列出系统所有任务，展示任务id、状态、执行者、依赖信息",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_get_task",
+            "description": "根据任务id获取单个任务完整详情",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "目标任务的id"
+                    }
+                },
+                "required": ["task_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_claim_task",
+            "description": "申领待执行任务，校验依赖通过后标记任务为执行中、分配给agent执行",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "要申领的任务id"
+                    }
+                },
+                "required": ["task_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_complete_task",
+            "description": "将正在执行的任务标记为已完成，自动解锁依赖该任务的下游任务",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "要完成的任务id"
+                    }
+                },
+                "required": ["task_id"]
+            }
+        }
+    }
+
+}]
 
 
 TOOL_HANDERS = {
@@ -1195,9 +1460,17 @@ TOOL_HANDERS = {
     "write":run_write,
     "edit":run_edit,
     "glob":run_glob,
+
     "todo_write":run_todo_write,
+
     "subagent":spawn_agent,
+
     "load_skill":load_skill,
+    "create_task": run_create_task,
+    "list_tasks": run_list_tasks,
+    "get_task": run_get_task,
+    "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
 }
 
 #===========动态构成system prompt======================================================================================
