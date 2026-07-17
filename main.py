@@ -1,5 +1,6 @@
 import ast
 import json
+import random
 import re
 import time
 import yaml
@@ -35,9 +36,17 @@ TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 # 压缩的工具调用结果放到该目录当中
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 
+#存放各种memory文件的地方
 MEMORY_DIR = WORKDIR / ".memory"; MEMORY_DIR.mkdir(exist_ok=True)
 
+#存放所有memory信息的索引文件
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+
+PRIMARY_MODEL = "deepseek-v4-pro"
+
+FALLBACK_MODEL_ID = "deepseek-v4"
+
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
 
 """   【该agent在运行功能时会产生的系统目录与文件】
 .task_outputs / tool-results/<tool_use_id>.txt
@@ -47,6 +56,124 @@ skills/<skill_name>和SKILL.md
 
 client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com")
+
+
+#==========模型调用错误处理机制====================================================================================================
+#升级后最大输出token上限
+ESCALATED_MAX_TOKENS = 64000
+#常规请求默认最大输出token
+DEFAULT_MAX_TOKENS = 8000
+#最大重试次数
+MAX_RECOVERY_RETRIES = 3
+#单次接口请求重试次数
+MAX_RETRIES = 10
+#基础等待毫秒
+BASE_DELAY_MS = 500
+#连续529错误阀值
+MAX_CONSECUTIVE_529 = 3
+#触发token上限后的续写提示
+CONTINUATION_PROMPT = (
+    "Output token limit hit. Resume directly — "
+    "no apology, no recap. Pick up mid-thought."
+)
+
+#状态存储  【全局记录本轮循环的重试状态】
+class RecoveryState:
+    """Track recovery attempts across the loop."""
+    def __init__(self):
+        #是否切换过备用模型
+        self.has_escalated = False
+        #累计重试总次数
+        self.recovery_count = 0
+        #连续的529错误次数
+        self.consecutive_529 = 0
+        #是否执行上下文压缩降级策略
+        self.has_attempted_reactive_compact = False
+        #当前使用的模型
+        self.current_model = PRIMARY_MODEL
+
+#计算重试等待时间(指数退避+随即抖动)
+def retry_delay(attempt, retry_after=None):
+    """attempt参数就是给with_retry()函数调用的参数
+    返回值是每次重试等待时间"""
+    if retry_after:
+        return retry_after
+    # 2**attempt是指数退避 等待时间每次成倍变长 上限记忆是32000毫秒也就是32秒
+    base = min(BASE_DELAY_MS * (2 ** attempt), 32000) / 1000
+    #在这个区间生成随机浮点数
+    jitter = random.uniform(0, base * 0.25)
+    return base + jitter
+
+
+def with_retry(fn, state: RecoveryState):
+    """大模型API请求的容错重试包装函数专门处理429请求限流和529服务商服务器过载
+    搭配指数退避延时和备用模型切换，遇到不可临时修复错误向上抛出交给外层代码处理
+    fn：模型调用函数
+    state：状态存储对象"""
+
+    # 模型请求成功 清空连续529 返回模型结果
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = fn()
+            state.consecutive_529 = 0
+            return result
+        except Exception as e:
+            #捕获异常类名 报错文本转小写方便匹配429请求频次超限限流和529关键字服务商服务器过载
+            name = type(e).__name__
+            msg = str(e).lower()
+
+            # 判断是否429限流错误  是的话就进行重试
+            if "ratelimit" in name.lower() or "429" in msg:
+                delay = retry_delay(attempt)
+                print(f"[429 rate limit] retry {attempt+1}/{MAX_RETRIES},"
+                      f" wait {delay:.1f}s")
+                time.sleep(delay)
+                continue
+
+            # 判断是否529过载错误 如果既不是429或529错误直接报错
+            if "overloaded" in name.lower() or "529" in msg or "overloaded" in msg:
+                state.consecutive_529 += 1
+                #判断连续过载次数是否达到阈值 超过就切换模型 如果没有备用模型就继续重试
+                if state.consecutive_529 >= MAX_CONSECUTIVE_529:
+                    if FALLBACK_MODEL:
+                        state.current_model = FALLBACK_MODEL
+                        state.consecutive_529 = 0
+                        print(f"{MAX_CONSECUTIVE_529}]"
+                              f" switching to {FALLBACK_MODEL}")
+                    else:
+                        state.consecutive_529 = 0
+                        print(f"{MAX_CONSECUTIVE_529}]"
+                              f" no FALLBACK_MODEL_ID configured, continuing retry")
+                # 延迟个一些时间再次重试
+                delay = retry_delay(attempt)
+                print(f" [529 overloaded] retry {attempt+1}/{MAX_RETRIES},"
+                      f" wait {delay:.1f}s")
+                time.sleep(delay)
+                continue
+
+            raise
+    # 超过最大重试次数 还是无法解决 抛出异常
+    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+
+
+def is_prompt_too_long_error(e: Exception) -> bool:
+    """捕获异常是否是上下文超出模型窗口上限的错误"""
+    msg = str(e).lower()
+    return (("prompt" in msg and "long" in msg)
+            or "prompt_is_too_long" in msg
+            or "context_length_exceeded" in msg
+            or "max_context_window" in msg)
+
+
+def reactive_compact(messages: list) -> list:
+    """应急精简对话历史，解决上下文超长问题"""
+    print(" [reactive compact] trimming to last 5 messages")
+    tail = messages[-5:]
+    return [{"role": "user",
+             "content": "[Reactive compact] Earlier conversation trimmed. "
+                        "Continue from where you left off."}, *tail]
+
+
 
 
 
@@ -1294,6 +1421,7 @@ def agent_loop(messages:list,context):
     #len-1是为了能够下标取值刚好取到最新的消息
     memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
 
+
     # <===7===>
     # 加入系统提示词  根据context  每轮agent_loop循环一次，重新生成一次看是否命中缓存
     system = get_system_prompt(context)
@@ -1303,9 +1431,16 @@ def agent_loop(messages:list,context):
         else:
             messages.insert(0, {"role": "system", "content": system})
     
+    #<===8===>
+    #定义error_recovery的状态
+    state = RecoveryState()
+
+    max_tokens = DEFAULT_MAX_TOKENS
 
 
     while True:
+
+
         #<===6===>
         #拿到干净的对话消息不要tool_calls的
         pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
@@ -1339,13 +1474,17 @@ def agent_loop(messages:list,context):
                 }
 
         try:
-            response = client.chat.completions.create(
-            model="deepseek-v4-pro",
+
+            #<====1====><====8====>
+            #在调用模型上加入429和529错误重试
+            response = with_retry(lambda mt=max_tokens ,mdl=state.CURRENT_MODEL:client.chat.completions.create(
+            model=mdl,
             messages=request_messages,
             tools=TOOLS,
-            max_tokens=8000
-            )
+            max_tokens=max_tokens,
+            ),state)
             reactive_retries = 0  # reset on successful API call
+        
         except Exception as e:
             # <====5====>
             # 这里是触发紧急压缩 之前的消息只会保留最后五个和加上总结的消息
@@ -1359,8 +1498,48 @@ def agent_loop(messages:list,context):
                 continue
             raise
 
+            # <====8====>
+            # error recovery  如果经过紧急压缩还是不行的话就会触发error recovery
+            if is_prompt_too_long_error(e):
+                if not state.has_attempted_reactive_compact:
+                    messages[:] = reactive_compact(messages)
+                    state.has_attempted_reactive_compact = True
+                    continue
+                print("[unrecoverable] still too long after compact")
+                messages.append({"role":"assistant","content":"[Error] Context too large, cannot continue."})
+                return
+
+                #错误无法covery
+                name = type(e).__name__
+                print(f"[unrecoverable] {name}: {str(e)[:100]}")
+                messages.append({"role": "assistant", "content":f"[Error] {name}: {str(e)[:200]}"})
+                return
+
+        #<====2====><====8====>
+        #如果模型返回的max_tokens触发了就不会再走下面的将response消息添加到messages中 所以在这里就要添加了
+        #【如果触发了max_tokens模型停止 先判段是否出发了增加token处理没有的话先扩大token继续重试，若重试次数超过3次则直接返回退出】
+        if response.finish_reason == "max_tokens":
+            if not state.has_escalated:
+                max_tokens = ESCALATED_MAX_TOKENS
+                state.has_escalated = True
+                print(f" [max_tokens] escalating"
+                      f" {DEFAULT_MAX_TOKENS} -> {ESCALATED_MAX_TOKENS}")
+                continue
+            # 64K still truncated: save truncated output + continuation prompt
+            messages.append({"role": "assistant", "content": response.content})
+            if state.recovery_count < MAX_RECOVERY_RETRIES:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                state.recovery_count += 1
+                print(f" [max_tokens] continuation"
+                      f" {state.recovery_count}/{MAX_RECOVERY_RETRIES}")
+                continue
+            print(" [max_tokens] recovery limit reached")
+            return
+
+
 
         # <====1=====>
+        #这里就是处理模型回复的消息将内容放入到messages中若有tool_calls也放入
         assistant_msg = response.choices[0].message
         msg = {"role": "assistant", "content": assistant_msg.content}
         # 这里就是添加content和tool_calls 判断有的话就添加  先正常放入content
@@ -1385,6 +1564,9 @@ def agent_loop(messages:list,context):
             extract_memories(pre_compress)
             consolidate_memories()
             return
+
+
+
 
 
         # 从此相当于进入到了下一轮因为它在上一步并没有离开
