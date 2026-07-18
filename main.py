@@ -1,4 +1,5 @@
 import ast
+import threading
 from dataclasses import asdict, dataclass
 import json
 import random
@@ -43,8 +44,10 @@ MEMORY_DIR = WORKDIR / ".memory"; MEMORY_DIR.mkdir(exist_ok=True)
 #存放所有memory信息的索引文件
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
+# 默认模型
 PRIMARY_MODEL = "deepseek-v4-pro"
 
+#备用模型 error_recovery会用
 FALLBACK_MODEL = "deepseek-v4"
 
 """   【该agent在运行功能时会产生的系统目录与文件】
@@ -56,7 +59,10 @@ skills/<skill_name>和SKILL.md
 client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com")
 
+
 #==========持久化任务系统==============================================================================================================
+#就像排火车一个个完成 不能越过一个完成下一个
+
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
 
@@ -77,6 +83,7 @@ def _task_path(task_id: str) -> Path:
 #实例化任务对象并存入json文件 【第三个函数使用第一个函数功能第二个函数使用第三个函数功能达到闭环】
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
+    """是每个任务里有个blockedby待做项"""
     task = Task(
         # 生成任务id time.time()生成时间戳 从1970到现在总秒数带小数所以int()
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
@@ -92,7 +99,10 @@ def create_task(subject: str, description: str = "",
 #  下面几乎都能创建文件
 #将task对象内容转成字典再转成json字符串存入json文件 为上面函数服务
 def save_task(task: Task):
-    """将task对象转成字典并保存为json文件 会顺便创建文件"""
+    """
+    将task对象转成字典并保存为json文件 会顺便创建文件
+    将任务对象内容保存在文件中
+    """
     _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
 
 #加载单个任务对象 【根据id从任务文件加载任务对象】
@@ -153,7 +163,7 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
     task.owner = owner
     task.status = "in_progress"
     save_task(task)
-    
+
     print("[claim] {task.subject} → in_progress (owner: {owner})")
     return f"Claimed {task.id} ({task.subject})"
 
@@ -185,7 +195,6 @@ def complete_task(task_id: str) -> str:
 
 
 #==== 定义task工具 =====
-#run_create_task和run_list_tasks,run_get_task工具相当于是 "读"
 
 #<====== 创建任务 ======>
 def run_create_task(subject: str, description: str = "",
@@ -202,8 +211,8 @@ def run_list_tasks() -> str:
         return "No tasks. Use create_task to add some."
     lines = []
     for t in tasks:
-        icon = {"pending": "○", "in_progress": "●",
-                "completed": "✓"}.get(t.status, "?")
+        #将每个任务转成一个字符串(内有blockedby owner suject id icon)放进列表中再转成字符串
+        icon = {"pending": "○", "in_progress": "●","completed": "✓"}.get(t.status, "?")
         deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
         owner = f" [{t.owner}]" if t.owner else ""
         lines.append(f"  {icon} {t.id}: {t.subject} "
@@ -1473,6 +1482,103 @@ TOOL_HANDERS = {
     "complete_task": run_complete_task,
 }
 
+#==========后台任务=====================================================================================================================
+#后台任务编号自增器
+_bg_counter = 0
+#存放所有正在运行/已结束的后台任务的基础信息
+background_tasks: dict[str, dict] = {}   # bg_id → {tool_use_id, command, status}
+#存放后台任务跑完后的输出内容
+background_results: dict[str, str] = {}   # bg_id → output
+#多线程锁
+background_lock = threading.Lock()
+
+
+def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
+    """判断命令是否耗时"""
+    if tool_name != "bash":
+        return False
+    cmd = tool_input.get("command", "").lower()
+    slow_keywords = ["install", "build", "test", "deploy", "compile",
+                     "docker build", "pip install", "npm install",
+                     "cargo build", "pytest", "make"]
+    return any(kw in cmd for kw in slow_keywords)
+
+def should_run_background(tool_name: str, tool_input: dict) -> bool:
+    """判断命令是否需要后台运行"""
+    if tool_input.get("run_in_background"):
+        return True
+    return is_slow_operation(tool_name, tool_input)
+
+
+def execute_tool(block) -> str:
+    """执行工具 返回结果"""
+    handler = TOOL_HANDERS.get(block.name)
+    if handler:
+        return handler(**block.input)
+    return f"Unknown tool: {block.name}"
+
+
+def start_background_task(block) -> str:
+    """
+    1.生成后台任务编号
+    2.定义子线程任务worker
+       子线程内部调用execute_tool跑完整工具逻辑;执行完成后,加锁修改共享字典:把任务状态改为completed
+       保存执行输出到background_results
+    3.主线程登记任务
+       主线程先获取锁,往background_tasks中登记任务信息 完成登记后释放锁
+    4.返回任务编号
+
+    这里就是判断命令然后将其挂载后台执行 并存储下信息就让后台自己运行 函数先执行退出了
+    """
+    global _bg_counter
+    _bg_counter += 1
+    bg_id = f"bg_{_bg_counter:04d}"
+    cmd = block.input.get("command", block.name)
+
+    def worker():
+        result = execute_tool(block)
+        with background_lock:
+            background_tasks[bg_id]["status"] = "completed"
+            background_results[bg_id] = result
+
+    with background_lock:
+        background_tasks[bg_id] = {
+            "tool_use_id": block.id,
+            "command": cmd,
+            "status": "running",
+        }
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    print(f"[background] dispatched {bg_id}: {cmd[:40]}")
+    return bg_id
+
+
+
+def collect_background_results() -> list[str]:
+    """收集已经执行完成的后台任务,整理成通知文本,交给大模型知晓后台任务跑完了"""
+    #筛选出已完成任务  加锁防止子线程正在修改任务状态时读取到的错乱数据:上锁原理就是线程a执行到这里会把锁站住此时其他线程执行执行同一行时,会卡在这里,等待锁被释放
+    with background_lock:
+        ready_ids = [bid for bid, task in background_tasks.items()
+                     if task["status"] == "completed"]
+    notifications = []
+    for bg_id in ready_ids:
+        #把任务执行结果从全局字典删除 以便不反复项模型推送同一条任务完成通知 pop修改了共享字典所以再次加锁保护
+        with background_lock:
+            task = background_tasks.pop(bg_id)
+            output = background_results.pop(bg_id, "")
+        summary = output[:200] if len(output) > 200 else output
+        notifications.append(
+            f"<task_notification>\n"
+            f"  <task_id>{bg_id}</task_id>\n"
+            f"  <status>completed</status>\n"
+            f"  <command>{task['command']}</command>\n"
+            f"  <summary>{summary}</summary>\n"
+            f"</task_notification>")
+        print(f"[background done] {bg_id}: "
+              f"{task['command'][:40]} ({len(output)} chars)")
+    return notifications
+
+
 #===========动态构成system prompt======================================================================================
 """
 updata_context就是负责看消息列表判断需不需要加上memoies的参数也就是MEMORY里的内容 返回context 
@@ -1848,37 +1954,50 @@ def agent_loop(messages:list,context):
         count_todo+=1
 
         
-     
-        
-        results = []
+        #background工具结果
+        results_background = []
         # <====3====>
         # arg_special是钩子函数的block args是工具函数的block参数
         for tc in response.choices[0].message.tool_calls:
 
-
+            tc_ture= json.loads(tc.function.arguments)
             # <====5=====><====3====>虽然介绍了函数但没有在tool_handler中定义
-            if tc.name == "compact":
+            if tc.function.name == "compact":
                 messages[:] = compact_history_tool(messages)
-                results.append({"type": "tool_result", "tool_use_id": tc.id,
-                                "content": "[Compacted. Conversation history has been summarized.]"})
-                messages.append({"role": "user", "content": results})
+                messages.append({"role": "user", "content": "Compacted. Conversation history has been summarized."})
                 # *紧急压缩但他会把system也压缩掉所以在这里补上
                 if not messages or messages[0].get("role") != "system":
                     messages.insert(0, {"role": "system", "content": system})
                 break  # end current turn, start fresh with compacted context
-            
-            #如果没有函数调用看一下
-            if not tc:
-                continue
 
-
+           
+            # 函数调用前钩子函数放在这里 可以确保后台执行或直接运行函数都可以运行
             arg_special=tc
-            # ==钩子函数== 虽然接受钩子函数的返回值并写入tool里面但是这些钩子函数都没有返回值
+            # ====钩子函数==== 
             blocked=trigger_hook("BEFORE_TOOL", arg_special)
             if blocked:
+                #虽然接受钩子函数的返回值并写入tool里面但是这些钩子函数都没有返回值
                 messages.append({"role":"tool","content":blocked})
                 continue
 
+            #<====9====> 
+            #这样确保函数能够能够正常执行参数 因为openai返回的参数是对象
+            class ToolCallAdapter:
+                def __init__(self, tc):
+                    self.id = tc.id
+                    self.name = tc.function.name
+                    self.input = json.loads(tc.function.arguments)
+
+            block = ToolCallAdapter(tc)
+            # 模型触发了几次后台任务就添加几个results_background里 里面会有多个tool但openai就是可以连着有多个   
+            # 这里只是提取名字进入列表
+            if should_run_background(block.name, block.input):
+                bg_id = start_background_task(block)
+                results_background.append({"role": "tool", "tool_call_id": tc.id,
+                                "content": f"[Background task {bg_id} started] ..."})
+                # 这个continue很关键  <因为先判断是否工具函数要后台执行如果需要的continue 就会跳到下一个循环 没有的话就按照正常执行工具函数>
+                continue
+            
 
 
             #==进行工具调用handler==  调用工具就是把模型想要工具参数放进函数里，里面都是自动化开始处理
@@ -1889,11 +2008,22 @@ def agent_loop(messages:list,context):
                 output = handler(**args) if isinstance(args, dict) else handler(args)#单工具的调用output = run_bash(args["command"])
             else:
                 output = f"error: unknown tool {tc.function.name}"
-            # ==钩子函数==
+            # ====钩子函数====
             trigger_hook("AFTER_TOOL", arg_special, output)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
-        
-        
+
+
+        # <====9====>
+        # 1. 把后台任务的占位 tool 结果逐条写入 messages
+        for r in results_background:
+            messages.append(r)
+
+        # 2. 收集已完成的后台任务，作为 user 消息通知模型
+        bg_notifications = collect_background_results()
+        if bg_notifications:
+            for notif in bg_notifications:
+                messages.append({"role": "user", "content": notif})
+            print(f"  [inject] {len(bg_notifications)} background notification(s)")
 
 
 
