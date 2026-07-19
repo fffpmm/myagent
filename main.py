@@ -1,6 +1,7 @@
 import ast
 import datetime
 import threading
+import queue
 from dataclasses import asdict, dataclass
 import json
 import random
@@ -60,7 +61,263 @@ skills/<skill_name>和SKILL.md
 client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com")
 
-#==========定时操作系统===================================================================================================================
+#========== 多agent系统 ===================================================================================================================
+""""
+现在功能先是用run_send_inbox建立一个agent队友的信箱然后分配一个agent，
+就是建立agent这个agent队友信箱的agent名字 用run_spawn_teamate创建队友刚好这个agent一上来也能识别到主agent让他干的事了干完直接这个函数内部也会将任务结果发进主agent的收件箱
+收到tool的结果后就可以再次调用工具函数看自己的信箱这个工具函数会将列表转成一个大的字符串 然后作为工具结果让agent知道
+*现在这里没有主agent不会自动被队友通知任务已经完成可以去看看结果了 所有在agent_loop要加入这个功能
+"""
+
+
+
+
+MAILBOX_DIR = WORKDIR / ".mailboxes"
+MAILBOX_DIR.mkdir(exist_ok=True)
+
+
+class MessageBus:
+    """
+    基于文件实现的消息总线
+
+    每个 Agent（包括 Lead 和队友）有一个 .jsonl 邮箱。发消息 = 往对方的文件里 append 一行 JSON。读消息 = 读文件 + 删除（消费式）
+    """
+
+    def send(self, from_agent: str, to_agent: str, content: str, msg_type: str = "message"):
+        """
+        发送消息，写入接收方的收件箱  把消息的来方和发给方和内容一起写入收件箱  
+        会顺便建立接收方的收件箱
+        相当于每个agent都会有一个专属信箱用完就会删除
+
+        :param from_agent: 发送方
+        :param to_agent: 接收方
+        :param content: 消息内容
+        :param msg_type: 消息类型，默认为"message"
+        :return: None
+        """
+
+        msg = {"from": from_agent, "to": to_agent,
+               "content": content, "type": msg_type,
+               "ts": time.time()}
+        inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
+        with open(inbox, "a") as f:
+            f.write(json.dumps(msg) + "\n")
+
+        print(f"  [bus] {from_agent} → {to_agent}: "
+              f"{content[:50]}")
+
+
+    def read_inbox(self, agent: str) -> list[dict]:
+        """
+        读取并消费收件箱的全部消息 读取完就直接销毁（破坏性读取）
+        相当于每个agent都会有一个专属信箱用完就会删除
+        
+        :param agent: 收件箱的收件人
+        :return: 将一行行的json对象返回一个个json字符串转成字典存入列表 （字典内格式为"from": from_agent, "to": to_agent,"content": content, "type": msg_type,"ts": time.time(）
+        """
+        inbox = MAILBOX_DIR / f"{agent}.jsonl"
+        if not inbox.exists():
+            return []
+        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+                if line.strip()]
+        inbox.unlink()  # consume: read + delete
+        return msgs
+
+
+    def peek(self, agent: str) -> bool:
+        """
+        窥探信箱（非破坏性读取）
+        相当于每个agent都会有一个专属信箱用完就会删除
+
+        :param agent: 收件箱的收件人
+        :return: 是否有未读消息 bool
+        """
+        inbox = MAILBOX_DIR / f"{agent}.jsonl"
+        # 判断信箱是否存在且里面有内容
+        return inbox.exists() and inbox.stat().st_size > 0
+
+
+BUS = MessageBus()
+
+# ── 全局团队成员管理 ──
+active_teammates: dict[str, bool] = {}
+
+
+# ── Teammate Thread  ──
+
+def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+    """
+    校验全局成员agent是有队员 构造子agent的系统提示 定义线程内执行逻辑run
+
+    Lead 调用 spawn_teammate 工具启动一个队友。队友跑在自己的 daemon 线程里，有自己的 system prompt、自己的 messages、自己的简化工具集
+    线程内运行逻辑：
+    1. 创建一个线程，并启动
+    2. 创建一个全局的active_teammates字典，将线程名作为键，线程对象作为值
+    完成后自动汇报：BUS.send(name, "lead", summary) 把最终结果发到 Lead 的收件箱
+    """
+
+    # 判断子agent是否存在
+    if name in active_teammates:
+        return f"Teammate '{name}' already exists"
+
+    #构造系统提示prompt
+    system = (f"You are '{name}', a {role}. "
+              f"Use tools to complete tasks. "
+              f"Send results via send_message to 'lead'.")
+
+    #子线程的运行逻辑
+    def run():
+        messages = [{"role": "user", "content": prompt}]
+        sub_tools = [
+            {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "运行一个命令去工作",
+            "parameters": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "设置一个命令"
+                    }
+                }
+            }
+        }
+    },{
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "读取一个文件的内容",
+            "parameters": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径"
+                    },
+                    "limit":{
+                        "type":"integer",
+                        "description":"限制读取的行数"
+                    }
+                }
+            }
+        }
+    },{
+        "type": "function",
+        "function": {
+            "name": "write",
+            "description": "写入一个文件的内容",
+            "parameters": {
+                "type": "object",
+                "required": ["path","content"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径"
+                    },
+                    "content":{
+                        "type":"string",
+                        "description":"写入的内容"
+                    }
+                }
+            }
+        }
+    } ]
+        sub_handlers = {
+            "bash": run_bash, "read": run_read, "write": run_write,
+            "send_message": lambda to, content: (BUS.send(name, to, content), "Sent")[1],
+        }
+
+        for _ in range(10):
+
+            # 读取自身的收件箱看有没有来自lead的消息
+            inbox = BUS.read_inbox(name)
+            if inbox:
+                messages.append({"role": "user",
+                                 "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
+            try:
+                response = client.messages.create(
+                    model="deepseek-v4-pro", system=system, messages=messages[-20:],
+                    tools=sub_tools, max_tokens=8000)
+            except Exception:
+                break
+            
+            messages.append({"role": "assistant", "content": response.choices[0].message.content})
+            if response.finish_reason != "tool_use":
+                break
+
+            results = []
+            for block in response.choices[0].message.tool_calls:
+                    block_ture = block.model_dump(block)
+                    handler = sub_handlers.get(block_ture["function"]["name"])
+                    output = handler(**block_ture["function"]["arguments"]) if handler else "Unknown"
+                    results.append({"role": "tool",
+                                    "tool_use_id": block_ture["id"],
+                                    "content": str(output)})
+            messages += results
+
+        # 循环结束 把总结结果发送给lead
+        summary = "Done."
+        for msg in reversed(messages):
+            if msg["role"] == "assistant" and isinstance(msg["content"], str):    
+                summary = msg["content"]
+                break
+            else:
+                    continue
+            break
+
+        #发给lead消息后 就删除了线程和存在全局的对象
+        BUS.send(name, "lead", summary, "result")
+        active_teammates.pop(name, None)
+        print(f" [teammate] {name} finished")
+
+    #该线程run函数执行完就自动销毁了或由于daemon守护线程如果在整个主线程执行完这个线程还没有完成也会关闭销毁
+    active_teammates[name] = True
+    threading.Thread(target=run, daemon=True).start()
+
+    print(f" [teammate] {name} spawned as {role}")
+    return f"Teammate '{name}' spawned as {role}"
+
+
+# ── Team Tool Handlers ──
+
+
+def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
+    """ 创建一个协作agent """
+    return spawn_teammate_thread(name, role, prompt)
+
+
+def run_send_message(to: str, content: str) -> str:
+    """ 主agent向其他agent发送工具消息 """
+    BUS.send("lead", to, content)
+    return f"Sent to {to}"
+
+
+def run_check_inbox() -> str:
+    """
+    主agent读取自身收件箱工具
+    将列表内一个个内容转成一个个字符串存入列表再次转成一个大的字符串
+    """
+    
+    msgs = BUS.read_inbox("lead")
+    
+    if not msgs:
+        return "(inbox empty)"
+    
+    lines = []
+    for m in msgs:
+        lines.append(f"  [{m['from']}] {m['content'][:200]}")
+    return "\n".join(lines)
+
+#========== 定时操作系统 ===================================================================================================================
+
+
+
+
+
 DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 
 #定时任务的数据结构
@@ -334,8 +591,7 @@ def cron_scheduler_loop():
 
 
 def consume_cron_queue() -> list[CronJob]:
-    """清空已触发的任务队列，给agent调用
-    
+    """清空已触发的任务队列
     返回已触发的任务列表"""
     with cron_lock:
         fired = list(cron_queue)
@@ -386,8 +642,20 @@ def run_cancel_cron(job_id: str) -> str:
     return cancel_job(job_id)
 
 
-#==========持久化任务系统==============================================================================================================
+#========== 持久化任务系统 task_prompt ==============================================================================================================
+"""
+把任务以 JSON 文件持久化（.tasks/），并通过简单的“blockedBy 依赖 + 三态（pending → in_progress → completed）”规则
+暴露成若干工具（create/list/get/claim/complete），并由一个 agent loop 调用这些工具来管理与执行任务的系统
+
+任务系统是“被动”的：它把操作暴露为模型工具，模型必须主动调用，或者需要外部实体直接写入 .tasks/*.json 或调用这些函数（从脚本/服务/手动编辑）来创建或更改任务状态
+"""
+
 #就像排火车一个个完成 不能越过一个完成下一个
+
+
+
+
+
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -403,9 +671,11 @@ class Task:
     owner: str | None    # Agent name (multi-agent scenarios)
     #列表里面存放的都是前置任务的task_id
     blockedBy: list[str] 
+
 #创建任务文件路径
 def _task_path(task_id: str) -> Path:
     return TASKS_DIR / f"{task_id}.json"
+
 #实例化任务对象并存入json文件 【第三个函数使用第一个函数功能第二个函数使用第三个函数功能达到闭环】
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
@@ -564,7 +834,25 @@ def run_complete_task(task_id: str) -> str:
 
 
 
-#==========模型调用错误处理机制====================================================================================================
+#========== 模型调用错误处理机制 error_recovery ====================================================================================================
+"""
+功能实现的位置：LLM 请求被一个“重试包装器” with_retry 包裹，用来处理短暂的服务端错误（429/529 等） 3. — 429 / 529（速率限制 / 过载）与指数退避，和切换模型
+                外层 try/except 处理 1.提示/上下文太长2.响应因 max_tokens 截断  就翻倍再试
+
+•模型返回 stop_reason == "max_tokens"：
+    ◦ 第一次升级 max_tokens (8k -> 64k) 并重试；
+    ◦ 若仍被截断，保存截断内容并追加 continuation prompt，最多三次继续恢复。
+• 请求时报 429：
+    ◦ with_retry 按指数退避 (带抖动) 重试，最多 10 次。
+• 请求接连出现 529（overloaded）三次：
+    ◦ 如果配置了 FALLBACK_MODEL_ID 则切换到回退模型继续请求；否则继续退避并重试
+• prompt/context 太长 -> 响应性压缩
+"""
+
+
+
+
+
 #升级后最大输出token上限
 ESCALATED_MAX_TOKENS = 64000
 #常规请求默认最大输出token
@@ -682,7 +970,18 @@ def error_recovey_energency_compact(messages: list) -> list:
 
 
 
-#===========记忆功能====================================================================================================
+#=========== 记忆功能 ====================================================================================================
+"""
+emory 功能就是把“长期有用的信息”从对话中抽取成独立的 Markdown 文件（带 YAML 元数据）
+用一个索引（MEMORY.md）管理；每轮会话开始时把索引注入 system prompt 并按需把相关记忆注入上下文； =这里与动态system融合了=
+每轮结束（对话稳定、非工具调用时）让模型抽取新记忆写入文件；记忆会定期合并/去重（consolidate / Dream） =(agent_loop写死的)=
+"""
+
+
+
+
+
+
 MEMORY_TYPES = ["user", "feedback", "project", "reference"]
 
 def extract_text_memory(response: str) -> str:
@@ -1004,6 +1303,12 @@ def build_memory_system() -> str:
 
 #===========SKILL加载工具函数===========================================================================================
 
+
+
+
+
+
+
 #解析文件中yaml配置信息  meta（part(1）拿到就是上下---中间的内容这个内容就是简介 part（2）相当于详细内容
 def _parse_frontmatter(text):
     if not text.startswith("---"):
@@ -1068,7 +1373,14 @@ def load_skill(name: str) -> str:
 
 
 #============核心功能工具函数==================================================================================================
-def run_bash(command:str):
+
+
+
+
+
+
+def run_bash(command:str,run_in_background:bool=False):
+    """run_in_background is handled by agent_loop dispatch, not here"""
     # dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     # if any(a in command for a in dangerous):
     #     return "error:出现了越级的命令"
@@ -1133,6 +1445,12 @@ def run_glob(patten:str):
 #========聚焦任务目标工具函数（该工具不进行外部操作只做提醒和打印在终端）======================================================================
 # TodoWrite 是当前任务的执行清单，保存在会话内存中
 
+
+
+
+
+
+
 # 对todos的消息类型进行检测 只要列表里是字典的   todos这个参数也是像其它工具函数一样的由大模型定义给它
 def _normalize_todos(todos):
     if isinstance(todos,str):
@@ -1177,21 +1495,32 @@ def run_todo_write(todos:list):
 
 # =========子agent=====================================================================================================
 
+
+
+
+
+
+
 # 子agent工具调用
 SUB_TOOLS = [{
         "type": "function",
         "function": {
-            "name": "bash",
-            "description": "运行一个命令去工作",
+            "name": "run_bash",
+            "description": "执行shell命令；run_in_background设为true时交由调度层后台异步执行，主线程无需等待命令完成；单次前台执行最长超时120秒，输出最多截取前50000字符",
             "parameters": {
                 "type": "object",
-                "required": ["command"],
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "设置一个命令"
+                        "description": "待执行的完整shell命令字符串"
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": "是否后台异步运行，长时间编译、安装、部署类命令建议开启",
+                        "default": False
                     }
-                }
+                },
+                "required": ["command"]
             }
         }
     },{
@@ -1343,6 +1672,12 @@ def spawn_agent(description):
 # =========五层上下文消息压缩===============================================================================================
 #前三层如hook放入agent_loop里自动判断触发第四层是工具函数由模型调用
 # $$注意在l4和l5的时候会将system消息也给压缩了 所以要注意补上 已经在agent__loop补上了
+
+
+
+
+
+
 
 
 #上下文消息最终限制 若多余该值会触发紧急压缩
@@ -1511,6 +1846,13 @@ def emergency_compact(messages):
 
 
 # =========所有工具的JSON Schema==============================================================================================
+
+
+
+
+
+
+
 
 # 主工具说明
 TOOLS = [{
@@ -1848,7 +2190,67 @@ TOOLS = [{
     }
   }
 }
-}]
+},
+  {
+    "type": "function",
+    "function": {
+      "name": "run_spawn_teammate",
+      "description": "创建并启动后台运行的子协作Agent，分配子任务交由子Agent处理",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "子Agent唯一名称，不可和已创建的Agent重名"
+          },
+          "role": {
+            "type": "string",
+            "description": "子Agent的角色定位，例如数据整理员、代码运维员"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "下发给子Agent的具体任务要求"
+          }
+        },
+        "required": ["name", "role", "prompt"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_send_message",
+      "description": "主Lead Agent向指定其他Agent发送信箱消息",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "string",
+            "description": "接收消息的目标Agent名称"
+          },
+          "content": {
+            "type": "string",
+            "description": "要发送的消息正文内容"
+          }
+        },
+        "required": ["to", "content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_check_inbox",
+      "description": "读取Lead主Agent收件箱内所有子Agent发来的消息，读取后清空收件箱",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  }
+]
+
 
 
 TOOL_HANDERS = {
@@ -1872,9 +2274,28 @@ TOOL_HANDERS = {
     "schedule_cron": run_schedule_cron,
     "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,
+
+    "spawn_teammate":run_spawn_teammate,
+    "send_message": run_send_message,
+    "check_inbox": run_check_inbox,
 }
 
-#==========后台任务=====================================================================================================================
+#========== 后台任务 用于下载命令时 =====================================================================================================================
+"""
+should_run_background: 显式请求优先，启发式兜底
+
+start_background_task: 后台执行与生命周期
+把工具调用包装成 worker 函数，扔到 daemon 线程里执行。每个后台任务有唯一 ID，状态存在 background_tasks 字典里
+返回 bg_id 而不是只返回 [Running in background...]。daemon=True 确保 Agent 进程退出时线程跟着退出
+
+collect_background_results: 通知收集
+后台任务完成后，收集结果并格式化为 <task_notification> 通知
+"""
+
+
+
+
+
 #后台任务编号自增器
 _bg_counter = 0
 #存放所有正在运行/已结束的后台任务的基础信息
@@ -1896,7 +2317,9 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
     return any(kw in cmd for kw in slow_keywords)
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    """判断命令是否需要后台运行  内含is_slow_operation判断是否是耗时操作"""
+    """
+    判断命令是否需要后台运行  内含is_slow_operation判断关键字是否是耗时操作和模型自己判断是否要后台运行两种方法
+    """
     if tool_input.get("run_in_background"):
         return True
     return is_slow_operation(tool_name, tool_input)
@@ -1939,6 +2362,8 @@ def start_background_task(block) -> str:
             "command": cmd,
             "status": "running",
         }
+    
+    #先让状态为running worker执行完变为completed
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     print(f"[background] dispatched {bg_id}: {cmd[:40]}")
@@ -1947,11 +2372,17 @@ def start_background_task(block) -> str:
 
 
 def collect_background_results() -> list[str]:
-    """收集已经执行完成的后台任务,整理成通知文本,交给大模型知晓后台任务跑完了"""
+    """
+    收集已经执行完成的后台任务,整理成通知文本,交给大模型知晓后台任务跑完了
+    
+    根据全局变量存储的id 从全局变量中筛选出已完成任务
+    """
     #筛选出已完成任务  加锁防止子线程正在修改任务状态时读取到的错乱数据:上锁原理就是线程a执行到这里会把锁站住此时其他线程执行执行同一行时,会卡在这里,等待锁被释放
+    
     with background_lock:
         ready_ids = [bid for bid, task in background_tasks.items()
                      if task["status"] == "completed"]
+    
     notifications = []
     for bg_id in ready_ids:
         #把任务执行结果从全局字典删除 以便不反复项模型推送同一条任务完成通知 pop修改了共享字典所以再次加锁保护
@@ -1971,12 +2402,23 @@ def collect_background_results() -> list[str]:
     return notifications
 
 
+
+def has_pending_background() -> bool:
+    """检查是否有已完成但尚未收集的后台任务"""
+    with background_lock:
+        return any(t["status"] == "completed" for t in background_tasks.values())
+
+
 #===========动态构成system prompt======================================================================================
 """
 updata_context就是负责看消息列表判断需不需要加上memoies的参数也就是MEMORY里的内容 返回context 
 然后用get_system_prompt来看名不命中缓存如果命中还用上一次的prompt也就是_last_prompt若没有命中的话嗲
 用assemble_system_prompt重新组装prompt变成_last_prompt被用作系统提示词
 """
+
+
+
+
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -2116,6 +2558,12 @@ def trigger_hook(event:str,*args):
 
 # <====五种钩子函数只有permission_check函数是没有触发打印的条件的但是它是由log_function钩子函数触发====>
 
+
+
+
+
+
+
 # # 防越级操作钩子函数（三合一)  替代升级了上面的三合一的越级操作但功能一致 只是要将其注册为了钩子函数
 def permission_check_hook(block):
     if block.function.name == "bash":
@@ -2172,6 +2620,13 @@ register_hook("AFTER_AGENT",summary_hook)
 
 #=========agent循环========================================================================================================  =================
 
+
+
+
+
+
+
+
 count_todo=0
 
 # 看是否超过这个数值 超过了就无法在紧急压缩上下文了
@@ -2209,7 +2664,8 @@ def agent_loop(messages:list,context):
 
     while True:
 
-        # 消费 cron 队列，将已触发的定时任务注入为 user 消息
+        # <===10===>
+        # 消费 cron 队列，将已触发的定时任务注入为 user 消息 【一般第一轮达到不了这里经过内容几轮工具调用可能实施了定时任务那么在我们没有干涉的清空也会加入user消息来反馈】
         fired = consume_cron_queue()
         for job in fired:
             messages.append({
@@ -2218,6 +2674,7 @@ def agent_loop(messages:list,context):
             })
             print(f"  [inject cron] {job.prompt[:50]}")
         
+
         #<===6===>
         #拿到干净的对话消息不要tool_calls的
         pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
@@ -2354,7 +2811,7 @@ def agent_loop(messages:list,context):
         count_todo+=1
 
         
-        #background工具结果
+        #messages background存的是进行后台任务的id
         results_background = []
         # <====3====>
         # arg_special是钩子函数的block args是工具函数的block参数
@@ -2380,7 +2837,9 @@ def agent_loop(messages:list,context):
                 messages.append({"role":"tool","content":blocked})
                 continue
 
+
             #<====9====> 
+            # ---- 将后台任务结果 加入到messages中 -----
             #这样确保函数能够能够正常执行参数 因为openai返回的参数是对象
             class ToolCallAdapter:
                 def __init__(self, tc):
@@ -2392,6 +2851,7 @@ def agent_loop(messages:list,context):
             # 模型触发了几次后台任务就添加几个results_background里 里面会有多个tool但openai就是可以连着有多个   
             # 这里只是提取名字进入列表
             if should_run_background(block.name, block.input):
+                # 这里只是开启线程 并获得id 线程在内存开始干他的事在start_background_task并不拿他的线程结果 这里只是说下有后台任务了
                 bg_id = start_background_task(block)
                 results_background.append({"role": "tool", "tool_call_id": tc.id,
                                 "content": f"[Background task {bg_id} started] ..."})
@@ -2414,11 +2874,12 @@ def agent_loop(messages:list,context):
 
 
         # <====9====>
-        # 1. 把后台任务的占位 tool 结果逐条写入 messages
+        # ---- 等工具调用循环完 将后台任务结果 加入到messages中 -----
+        # 1. 把后台任务的占位 tool 的后台任务id逐条写入 --messages background存的是进行后台任务的id--
         for r in results_background:
             messages.append(r)
 
-        # 2. 收集已完成的后台任务，作为 user 消息通知模型
+        # 2. 收集已完成的后台任务的结果，作为 user 消息通知模型
         bg_notifications = collect_background_results()
         if bg_notifications:
             for notif in bg_notifications:
@@ -2474,8 +2935,11 @@ def thread_queue_processor_loop():
     """
     while True:
         time.sleep(0.2)
+        
         if not has_cron_queue():
             continue
+        
+        #这里已上锁在调用run_agent_turn_locked内部执行agent时就已经把agent上锁了
         if not agent_lock.acquire(blocking=False):
             continue
         try:
@@ -2486,31 +2950,119 @@ def thread_queue_processor_loop():
             
             # ----自动触发进入agent----
             run_agent_turn_locked()
+        # 最终必须释放锁
         finally:
             agent_lock.release()
 
 
 if __name__ == "__main__":
-    # 初始化 session 级别变量
+
+    # 初始化系统提示词 根据当前内容来判断是否加入记忆内容
     session_context = update_context({})
 
-    # 启动 cron 自动推送线程
+    """
+    三大守护线程 
+    thread_queue_processor_loop 用来检测定时任务
+    input_reader 监听用户输入
+    inbox_poller 每隔一秒检查队友agent，后台任务有没有返回结果
+
+    这三个线程都是一直运行直至退出
+    """
+
     threading.Thread(target=thread_queue_processor_loop, daemon=True).start()
     print("  [queue processor] started")
 
+    # ── 事件队列 + 双线程轮询 ──
+    # 收纳双线程的输入 该queue内部自动依次保存两者的输入 按顺序处理
+    events = queue.Queue()
+
+    def input_reader():
+        """
+        用户输入内容后，不直接调用agent，把（"user",输入内容）推入队列中；触发强制退出时推入（"quit",None）
+        """
+        while True:
+            try:
+                line = input(">> ")
+            except (EOFError, KeyboardInterrupt):
+                events.put(("quit", None))
+                return
+            events.put(("user", line))
+
+    def inbox_poller():
+        """
+        轮询收件箱和后台任务
+
+        每秒检察：有没有agent员工发来消息和后台任务有没有跑完；只要有新任务，就往队列中推送wake唤醒事件
+        通知主线程去读取收件箱，处理后台结果
+        """
+
+        while True:
+            time.sleep(1)
+            if BUS.peek("lead") or has_pending_background():
+                events.put(("wake", None))
+
+    threading.Thread(target=input_reader, daemon=True).start()
+    threading.Thread(target=inbox_poller, daemon=True).start()
+
+    had_teammates = False
     print("输入消息（exit/quit 退出）：")
+
+
+
+    """
+      ----主线程---- 
+      主线程从events队列消费事件，分三类处理：quit 退出；user 用户输入；wake 收件箱和后台结果
+      所有修改会话历史的操作都加agent_lock,避免线程数据冲突
+    """
     while True:
-        try:
-            query = input(">> ")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if query.strip().lower() in ("exit", "quit", ""):
-            break
+        kind, payload = events.get()
         
-        # ----手动输入进入agent----
-        # 用 agent_lock 包裹，和 cron 自动触发互斥
-        with agent_lock:
-            run_agent_turn_locked(query)
+        if kind == "quit":
+            break
+
+        if kind == "user":
+            if payload.strip().lower() in ("exit", "quit", ""):
+                break
+            with agent_lock:
+                session_history.append({"role": "user", "content": payload})
+                agent_loop(session_history, session_context)
+                # 更新 context 是否加入记忆提示词
+                session_context = update_context(session_context)
+
+        else:  # "wake"
+            with agent_lock:
+                parts = []
+                inbox = BUS.read_inbox("lead")
+                if inbox:
+                    parts.append("[Inbox]\n" + "\n".join(
+                        f"From {m['from']}: {m['content'][:200]}" for m in inbox))
+                bg = collect_background_results()
+                parts.extend(bg)
+                if not parts:
+                    continue
+                
+                session_history.append({"role": "user", "content": "\n".join(parts)})
+                print(f"\n  [wake: {len(inbox)} inbox + {len(bg)} background -> new turn]")
+                
+                agent_loop(session_history, session_context)
+                session_context = update_context(session_context)
+
+        # 打印 assistant 回复
+        if session_history:
+            last = session_history[-1]
+            if isinstance(last, dict) and last.get("role") == "assistant":
+                content = last.get("content", "")
+                if isinstance(content, str) and content:
+                    print(content)
+
+        # 队友全部完成时通知
+        if active_teammates:
+            had_teammates = True
+        elif had_teammates and not BUS.peek("lead") and not has_pending_background():
+            print("[all teammates done]")
+            had_teammates = False
+        print()
+
 
 
 

@@ -1,0 +1,353 @@
+"""
+
+count_todo=0
+
+# 看是否超过这个数值 超过了就无法在紧急压缩上下文了
+MAX_REACTIVE_RETRIES = 1
+def agent_loop(messages:list,context):
+
+    #这个参数是用来计数 达到某个数值就确定自己目标防止跑题
+    global count_todo
+
+    #这个参数用来判断是否触发紧急压缩上下文
+    reactive_retries = 0
+
+    #<===6===>
+    #加载出所有文件中相关记忆的内容合并成的字符串
+    memories_content = load_memories(messages)
+    #len-1是为了能够下标取值刚好取到最新的消息
+    memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
+
+
+    # <===7===>
+    # 加入系统提示词  根据context  每轮agent_loop循环一次，重新生成一次看是否命中缓存
+    system = get_system_prompt(context)
+    if not messages or messages[0].get("role") != "system" or messages[0]["content"] != system:
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system
+        else:
+            messages.insert(0, {"role": "system", "content": system})
+    
+    #<===8===>
+    #定义error_recovery的状态
+    state = RecoveryState()
+
+    max_tokens = DEFAULT_MAX_TOKENS
+
+
+    while True:
+
+        # <===10===>
+        # 消费 cron 队列，将已触发的定时任务注入为 user 消息 【一般第一轮达到不了这里经过内容几轮工具调用可能实施了定时任务那么在我们没有干涉的清空也会加入user消息来反馈】
+        fired = consume_cron_queue()
+        for job in fired:
+            messages.append({
+                "role": "user",
+                "content": f"[Scheduled] {job.prompt}"
+            })
+            print(f"  [inject cron] {job.prompt[:50]}")
+        
+
+        #<===6===>
+        #拿到干净的对话消息不要tool_calls的
+        pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
+            "content": str(m.get("content",""))} for m in messages]
+
+        #<====5====>    
+        messages[:] = tool_result_budget(messages)    # L3: persist large results first
+        messages[:] = snip_compact(messages)          # L1: trim middle
+        messages[:] = micro_compact(messages)         # L2: old result placeholders
+
+        #该段就是截断循环拿到之前所有的对话如果超过了法制会直接调用ai压缩重新变成一条总结user消息
+        if estimate_size(messages) > CONTEXT_LIMIT:
+            print("[auto compact]")
+            messages[:] = compact_history_tool(messages)
+            if not messages or messages[0].get("role") != "system":
+                messages.insert(0, {"role": "system", "content": system})
+
+        #<====4====>
+        if count_todo>3 and messages:
+            messages.append({"role": "user","content": f"注意请更新你的todos"})
+            count_todo=0
+
+        #<====6====>
+        # 把长期记忆拼进用户对话中  如果满足触发条件
+        request_messages = messages
+        if memories_content and memory_turn is not None and memory_turn < len(messages):
+                request_messages = messages.copy()
+                request_messages[memory_turn] = {
+                    **messages[memory_turn],
+                    "content": memories_content + "\n\n" + messages[memory_turn]["content"],
+                }
+
+        try:
+
+            #<====1====><====8====PATH3>
+            #429 和 529 统一走指数退避 + 抖动：第一次等 0.5 秒，第二次等 1 秒，第三次等 2 秒，最多 10 次。加随机抖动让并发请求不在同一时刻重试。连续 3 次 529 过载 → 切换到备用模型
+            response = with_retry(lambda mt=max_tokens ,mdl=state.CURRENT_MODEL:client.chat.completions.create(
+            model=mdl,
+            messages=request_messages,
+            tools=TOOLS,
+            max_tokens=max_tokens,
+            ),state)
+            reactive_retries = 0  # reset on successful API call
+        
+        except Exception as e:
+            
+            # <====8====PATH2>
+            # 四层压缩都无法进行的话 就触发这里的解决
+            # error recovery  如果经过紧急压缩还是不行的话就会触发error recovery
+            if is_prompt_too_long_error(e):
+                if not state.has_attempted_reactive_compact:
+                    messages[:] = error_recovey_energency_compact(messages)
+                    state.has_attempted_reactive_compact = True
+                    continue
+                print("[unrecoverable] still too long after compact")
+                messages.append({"role":"assistant","content":"[Error] Context too large, cannot continue."})
+                return
+
+            #错误无法covery
+            name = type(e).__name__
+            print(f"[unrecoverable] {name}: {str(e)[:100]}")
+            messages.append({"role": "assistant", "content":f"[Error] {name}: {str(e)[:200]}"})
+            return
+
+            # # <====5====>
+            # # 这里是触发紧急压缩 之前的消息只会保留最后五个和加上总结的消息
+            # if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
+            #     print("[reactive compact]")
+            #     # *紧急压缩但他会把system也压缩掉所以在这里补上
+            #     messages[:] = emergency_compact(messages)
+            #     if not messages or messages[0].get("role") != "system":
+            #         messages.insert(0, {"role": "system", "content": system})
+            #     reactive_retries += 1
+            #     continue
+            # raise
+
+
+        #<====2====><====8====PATH1>
+        #第一次发生时，直接把 max_tokens 从 8K 升级到64K(8倍空间),重试同一请求——此时不追加截断输出到 messages，保持原始请求不变。如果 64K 还是不够，才保存截断输出并注入续写提示让模型接着刚才的话继续说，最多 3 次
+        #如果模型返回的max_tokens触发了就不会再走下面的将response消息添加到messages中 所以在这里就要添加了
+        if response.choices[0].finish_reason == "max_tokens":
+            if not state.has_escalated:
+                max_tokens = ESCALATED_MAX_TOKENS
+                state.has_escalated = True
+                print(f" [max_tokens] escalating"
+                      f" {DEFAULT_MAX_TOKENS} -> {ESCALATED_MAX_TOKENS}")
+                continue
+            # 64K still truncated: save truncated output + continuation prompt
+            messages.append({"role": "assistant", "content": response.choices[0].messages.content})
+            if state.recovery_count < MAX_RECOVERY_RETRIES:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                state.recovery_count += 1
+                print(f" [max_tokens] continuation"
+                      f" {state.recovery_count}/{MAX_RECOVERY_RETRIES}")
+                continue
+            print(" [max_tokens] recovery limit reached")
+            return
+
+
+
+        # <====1=====>
+        #这里就是处理模型回复的消息将内容放入到messages中若有tool_calls也放入
+        assistant_msg = response.choices[0].message
+        msg = {"role": "assistant", "content": assistant_msg.content}
+        # 这里就是添加content和tool_calls 判断有的话就添加  先正常放入content
+        if assistant_msg.tool_calls:
+            msg["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in assistant_msg.tool_calls]
+        messages.append(msg)
+
+
+        # <====2=====>
+        # "分叉路口"如果没有工具调用就在此离开不然就继续进行工具的调用
+        if response.choices[0].finish_reason != "tool_calls":
+            # ==钩子函数==
+            trigger_hook("AFTER_AGENT", messages)
+            
+            # <====6=====>
+            # ==触发记忆函数==
+            # 第一个是创建新的多个memory文件 第二个整合删去老的重复的创建新的
+            # 上面定义的时候只能拿到到提问的时候内容在这里把模型回复的消息加上
+            pre_compress.append(response.choices[0].message.content)
+            extract_memories(pre_compress)
+            consolidate_memories()
+            return
+
+
+
+
+
+        # 从此相当于进入到了下一轮因为它在上一步并没有离开
+        count_todo+=1
+
+        
+        #messages background存的是进行后台任务的id
+        results_background = []
+        # <====3====>
+        # arg_special是钩子函数的block args是工具函数的block参数
+        for tc in response.choices[0].message.tool_calls:
+
+            tc_ture= json.loads(tc.function.arguments)
+            # <====5=====><====3====>虽然介绍了函数但没有在tool_handler中定义
+            if tc.function.name == "compact":
+                messages[:] = compact_history_tool(messages)
+                messages.append({"role": "user", "content": "Compacted. Conversation history has been summarized."})
+                # *紧急压缩但他会把system也压缩掉所以在这里补上
+                if not messages or messages[0].get("role") != "system":
+                    messages.insert(0, {"role": "system", "content": system})
+                break  # end current turn, start fresh with compacted context
+
+           
+            # 函数调用前钩子函数放在这里 可以确保后台执行或直接运行函数都可以运行
+            arg_special=tc
+            # ====钩子函数==== 
+            blocked=trigger_hook("BEFORE_TOOL", arg_special)
+            if blocked:
+                #虽然接受钩子函数的返回值并写入tool里面但是这些钩子函数都没有返回值
+                messages.append({"role":"tool","content":blocked})
+                continue
+
+
+            #<====9====> 
+            # ---- 将后台任务结果 加入到messages中 -----
+            #这样确保函数能够能够正常执行参数 因为openai返回的参数是对象
+            class ToolCallAdapter:
+                def __init__(self, tc):
+                    self.id = tc.id
+                    self.name = tc.function.name
+                    self.input = json.loads(tc.function.arguments)
+
+            block = ToolCallAdapter(tc)
+            # 模型触发了几次后台任务就添加几个results_background里 里面会有多个tool但openai就是可以连着有多个   
+            # 这里只是提取名字进入列表
+            if should_run_background(block.name, block.input):
+                # 这里只是开启线程 并获得id 线程在内存开始干他的事在start_background_task并不拿他的线程结果 这里只是说下有后台任务了
+                bg_id = start_background_task(block)
+                results_background.append({"role": "tool", "tool_call_id": tc.id,
+                                "content": f"[Background task {bg_id} started] ..."})
+                # 这个continue很关键  <因为先判断是否工具函数要后台执行如果需要的continue 就会跳到下一个循环 没有的话就按照正常执行工具函数>
+                continue
+            
+
+
+            #==进行工具调用handler==  调用工具就是把模型想要工具参数放进函数里，里面都是自动化开始处理
+            handler = TOOL_HANDERS.get(tc.function.name)
+            arg_special=tc
+            args = json.loads(tc.function.arguments)  #这么写是因为ai返回的response的json字符串必须先转化成python字典才能解包或者用[]
+            if handler:  # handler的参数可以由args随意提供因为我们使用的参数都是大模型提供，我只需要解包
+                output = handler(**args) if isinstance(args, dict) else handler(args)#单工具的调用output = run_bash(args["command"])
+            else:
+                output = f"error: unknown tool {tc.function.name}"
+            # ====钩子函数====
+            trigger_hook("AFTER_TOOL", arg_special, output)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+
+
+        # <====9====>
+        # ---- 等工具调用循环完 将后台任务结果 加入到messages中 -----
+        # 1. 把后台任务的占位 tool 的后台任务id逐条写入 --messages background存的是进行后台任务的id--
+        for r in results_background:
+            messages.append(r)
+
+        # 2. 收集已完成的后台任务的结果，作为 user 消息通知模型
+        bg_notifications = collect_background_results()
+        if bg_notifications:
+            for notif in bg_notifications:
+                messages.append({"role": "user", "content": notif})
+            print(f"  [inject] {len(bg_notifications)} background notification(s)")
+
+
+"""
+
+
+
+"""
+# ── 会话级全局变量（供 run_agent_turn_locked / queue_processor_loop 使用）──
+session_history: list = []
+session_context: dict = {}
+
+
+def run_agent_turn_locked(user_query: str | None = None):
+    """
+    加锁执行一轮 agent 回合。
+    手动输入和 cron 触发都走这里，agent_lock 保证互斥。
+    """
+    
+    global session_context
+    if user_query is not None:
+        session_history.append({"role": "user", "content": user_query})
+    agent_loop(session_history, session_context)
+    session_context = update_context(session_context)
+    
+    # 打印最新 assistant 文本
+    if session_history:
+        last = session_history[-1]
+        if isinstance(last, dict) and last.get("role") == "assistant":
+            content = last.get("content", "")
+            if isinstance(content, str):
+                print(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        print(block.get("text", ""))
+    print()
+
+"""
+"""
+"""
+def thread_queue_processor_loop():
+    """
+    后台线程：当 cron 触发了任务且 agent 空闲时，自动跑一轮 agent。
+
+    工作机制：
+    1. 每 0.2 秒检查 cron_queue 是否有待处理任务
+    2. 如果有，尝试拿 agent_lock（非阻塞）
+       - 拿到了 → agent 空闲 → 自动推送 cron 消息给模型
+       - 没拿到 → agent 正在处理用户请求 → 下轮再试
+    """
+    """"
+    while True:
+        time.sleep(0.2)
+        if not has_cron_queue():
+            continue
+        if not agent_lock.acquire(blocking=False):
+            continue
+        try:
+
+            if not has_cron_queue():          # 双重检查
+                continue
+            print("\n  [queue processor] delivering scheduled work")
+            
+            # ----自动触发进入agent----
+            run_agent_turn_locked()
+        # 最终必须释放锁
+        finally:
+            agent_lock.release()
+        """
+""""
+
+if __name__ == "__main__":
+    # 初始化 session 级别变量
+    session_context = update_context({})
+
+    # 启动 cron 自动推送线程
+    threading.Thread(target=thread_queue_processor_loop, daemon=True).start()
+    print("  [queue processor] started")
+
+    print("输入消息（exit/quit 退出）：")
+    while True:
+        try:
+            query = input(">> ")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if query.strip().lower() in ("exit", "quit", ""):
+            break
+
+        # ----手动输入进入agent----
+        # 用 agent_lock 包裹，和 cron 自动触发互斥
+        with agent_lock:
+            run_agent_turn_locked(query)
+"""
